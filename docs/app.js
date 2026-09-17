@@ -239,7 +239,13 @@ function suggestions(st, avail, lu, ctx) {
   const { open } = ctx;
   const scored = ctx.scored.filter((x) => !x.p.nt);
   const bestVal = Math.max(...scored.map((x) => valOf(x.p)));
-  return scored.slice(0, 3).map((x, i) => {
+  // show a mix: if the top three are all one position, swap the third for the best at another position
+  let pick3 = scored.slice(0, 3);
+  if (pick3.length === 3 && pick3.every((x) => x.p.slot === pick3[0].p.slot)) {
+    const alt = scored.find((x) => x.p.slot !== pick3[0].p.slot);
+    if (alt) pick3 = [pick3[0], pick3[1], alt];
+  }
+  return pick3.map((x, i) => {
     const why = [];
     if (Math.round(valOf(x.p)) >= Math.round(bestVal)) why.push({ t: "Most value left on the board" });
     if (x.fillS) why.push({ t: `Fills an open ${POSNAME[x.fillS].toLowerCase()} spot (you need ${lu.needs[x.fillS]} more)` });
@@ -435,7 +441,7 @@ function detailHTML(p, t, st) {
   if (v != null) lead = `<li class="info">${v >= 0 ? `About <b>${Math.round(v)}</b> more points than the best ${POSNAME[p.slot].toLowerCase()} you could grab off waivers.` : `Projects below a typical waiver-wire ${POSNAME[p.slot].toLowerCase()} in this league.`}</li>`;
   if (p.mp != null && p.mk != null && !p.rk) {
     const pn = POSNAME[p.slot].toLowerCase();
-    lead += `<li class="info">Our stats say <b>${fmt(p.mp)}</b> points. Where drafters take him (${p.mr ? ordinal(p.mr) + " " + pn : "rarely drafted"}) works out to about <b>${fmt(p.mk)}</b> in this scoring. His number, <b>${fmt(p.pts)}</b>, blends the two${p.slot === "G" ? " half and half" : ", mostly ours"}.</li>`;
+    lead += `<li class="info">Our stats say <b>${fmt(p.mp)}</b> points. Where drafters take him (${p.mr ? ordinal(p.mr) + " " + pn : "rarely drafted"}) works out to about <b>${fmt(p.mk)}</b> in this scoring. His number, <b>${fmt(p.pts)}</b>, blends the two (${Math.round(100 * (p.slot === "G" ? META.wModel.G : META.wModel.C))}% ours).</li>`;
   }
   if (p.unknown) lead = `<li class="info">Not in this board's player list, so there's no projection for him.</li>`;
   parts.push(`<div><h4>Why</h4><ul class="why">${lead}${why}</ul></div>`);
@@ -629,14 +635,24 @@ function renderHow() {
   <p class="note">One assumption: a player who can play center or wing is scored at the position you play him in. His card shows both numbers.</p>
 
   <h3>Projected points</h3>
-  <p>Every NHL player's last three seasons, from the NHL's own stats:</p>
+  <p>Projections are built in two steps from the NHL's own stats, going back to 2010-11.</p>
+  <p><b>Step 1: a base projection</b> from each player's last three seasons:</p>
   <ul>
     <li><b>Recent seasons count most.</b> Last season counts twice as much as the one before it, and four times as much as the one before that.</li>
-    <li><b>Goals come from shots.</b> We project how often he shoots, then how often his shots go in, using his whole career. A player who scored on way more (or fewer) of his shots than usual last season is expected to come back toward his normal rate.</li>
+    <li><b>Goals come from shots.</b> We project how often he shoots, then how often his shots go in over his whole career.</li>
     <li><b>Small samples get pulled toward a typical player</b> at his position, so 15 hot games don't make someone a star.</li>
     <li><b>Age.</b> Players 23 and younger are still getting better. Scoring usually starts slipping around 30 and drops faster after 33.</li>
-    <li><b>Games played</b> come from how many games he's played the last three seasons.</li>
-    <li><b>Goalies:</b> starts come mostly from last season's workload, shared out among the goalies on his current team. Wins, saves and shutouts are projected per start, with save percentage pulled hard toward league average because it jumps around so much year to year. If you know a team's depth chart better, open the goalie and set his starts yourself.</li>
+  </ul>
+  <p><b>Step 2: a learning model corrects the base.</b> It was trained on 13 seasons of "what we would have projected vs. what happened," so it knows where the simple method goes wrong. The signals it leans on most:</p>
+  <ul>
+    <li><b>Shooting luck:</b> a season with an unusually high or low shooting percentage.</li>
+    <li><b>Ice time and power-play time:</b> a player who played big minutes but had a quiet year usually gets more assists the next season.</li>
+    <li><b>How many of his team's goals he was in on while he was on the ice:</b> unusually high years usually don't repeat.</li>
+    <li><b>Primary vs. secondary assists</b>, experience, size, and whether he changed teams.</li>
+  </ul>
+  <p>Games played come from the same kind of model, using the last three seasons of games, ice time and age.</p>
+  <ul>
+    <li><b>Goalies:</b> starts start from recent workload. They're adjusted for age, save percentage, and how many other goalies on his 2026-27 team want the same starts. Points per game use his own numbers plus how often his new team won and how many shots it allowed. Then totals are pulled toward the middle, because in testing the top projected goalies kept coming in lower than projected (${META.gcal.top12_proj} projected vs ${META.gcal.top12_act} actual). If you know a team's depth chart better, open the goalie and set his starts yourself.</li>
     <li><b>Rookies and young players</b> without much NHL time lean on where Fantrax drafters are taking them.</li>
     <li><b>No NHL contract right now</b> means we cut the projection to a quarter, because most of those players won't play in the NHL this season.</li>
   </ul>
@@ -646,8 +662,7 @@ function renderHow() {
   <p>Tiers by value: <span class="pill tier" style="--tc:var(--t1)">Elite</span> 120+ · <span class="pill tier" style="--tc:var(--t2)">Great</span> 80–119 · <span class="pill tier" style="--tc:var(--t3)">Very good</span> 50–79 · <span class="pill tier" style="--tc:var(--t4)">Solid</span> 20–49 · <span class="pill tier" style="--tc:var(--t5)">Depth</span> 0–19 · <span class="pill tier" style="--tc:var(--t6)">Waiver level</span> below 0.</p>
 
   <h3>Our stats vs. where drafters take players</h3>
-  <p>Our projections only know past stats. Drafters know things stats don't, like a new backup taking starts, a team that got worse, or a player moving up to the top line. So every player's number is a blend. Our stats set how much each position is worth in <i>this</i> league's scoring. Where Fantrax drafters take him sets how good he is compared with other players at his position. Skaters are ${Math.round(META.wModel.C * 100)}% our stats and ${Math.round((1 - META.wModel.C) * 100)}% drafters. Goalies are half and half, because goalie projections are the least reliable.</p>
-  <p>Goalies also get one more fix. When we tested past seasons, the goalies we projected highest scored less than projected and backup-level goalies scored more (our top 12 averaged ${META.gcal.top12_proj} projected points but ${META.gcal.top12_act} actual). So goalie totals are pulled toward the middle before anything else happens.</p>
+  <p>Our projections only know past stats. Drafters know things stats don't, like a new backup taking starts, a team that got worse, or a player moving up to the top line. So every player's number is a blend. Our stats set how much each position is worth in <i>this</i> league's scoring. Where Fantrax drafters take him sets how good he is compared with other players at his position. Skaters are ${Math.round(META.wModel.C * 100)}% our stats and ${Math.round((1 - META.wModel.C) * 100)}% drafters. Goalies are ${Math.round(META.wModel.G * 100)}% ours, because goalie projections are the least reliable. Those splits come from testing against past seasons (see below).</p>
   <p>The draft board starts in <b>Best pick for you now</b> order. That's value, adjusted for whether a player fills an open starting spot and whether he's likely to last until your next turn. <span class="pill gold">Take soon</span> means he'll probably be gone before your following pick. <span class="pill good">Can wait</span> means he'll probably still be there, so you can grab someone else first. Switch to <b>Most value</b> to see the pure ranking.</p>
 
   <h3>“Left at your pick”</h3>
@@ -658,16 +673,19 @@ function renderHow() {
   <p>The draft order is the same every round (not a snake), with traded picks going to their new owners, and each pick has a 2-minute clock. While the page is open, it checks Fantrax for new picks every few seconds during the draft (every couple of minutes otherwise). Players disappear from the board as soon as Fantrax lists them. If Fantrax is slow or down, open a player and tap <b>Mark as drafted</b>. Fantrax's list takes over again once it catches up. Your stars, hand-marked picks and goalie starts are saved only in this browser. This page only reads from Fantrax and can't change anything in your league.</p>
 
   <h3>How accurate is it?</h3>
-  <p>We tested the method the honest way: projected each of the last three seasons (${esc(bt.seasons)}) using only the seasons before it, then compared the results with what actually happened. The comparison is simply using last season's numbers again.</p>
-  <div class="tablewrap"><table><thead><tr><th></th><th>This model</th><th>Last season again</th></tr></thead><tbody>
-    <tr><td>Skaters: points-per-game miss</td><td class="hl">${bt.skaters.model.ppg}</td><td>${bt.skaters.naive.ppg}</td></tr>
-    <tr><td>Skaters: season-total miss, top 300</td><td class="hl">${bt.skaters.model.tot}</td><td>${bt.skaters.naive.tot}</td></tr>
-    <tr><td>Skaters: ranking agreement, top 300 (1 = perfect)</td><td class="hl">${bt.skaters.model.rho}</td><td>${bt.skaters.naive.rho}</td></tr>
-    <tr><td>Goalies: points-per-game miss</td><td class="hl">${bt.goalies.model.ppg}</td><td>${bt.goalies.naive.ppg}</td></tr>
-    <tr><td>Goalies: season-total miss, top 60</td><td class="hl">${bt.goalies.model.tot}</td><td>${bt.goalies.naive.tot}</td></tr>
-    <tr><td>Goalies: ranking agreement, top 60</td><td class="hl">${bt.goalies.model.rho}</td><td>${bt.goalies.naive.rho}</td></tr>
+  <p>Every number below comes from projecting past seasons using <b>only the seasons before them</b>, then checking against what actually happened, in this league's scoring. Skaters were tested on ${bt.skaters.n_seasons} seasons (${esc(bt.seasons)}) and goalies on ${bt.goalies.n_seasons} (${esc(bt.goalies.seasons)}). Lower "miss" is better. For "ranking agreement," 1 would be perfect.</p>
+  <div class="tablewrap"><table><thead><tr><th></th><th>This model</th><th>Step 1 only</th><th>Last season again</th></tr></thead><tbody>
+    <tr><td>Skaters: points-per-game miss</td><td class="hl">${bt.skaters.model.ppg}</td><td>${bt.skaters.v1.ppg}</td><td>${bt.skaters.naive.ppg}</td></tr>
+    <tr><td>Skaters: season-total miss, top 300</td><td class="hl">${bt.skaters.model.tot}</td><td>${bt.skaters.v1.tot}</td><td>${bt.skaters.naive.tot}</td></tr>
+    <tr><td>Skaters: ranking agreement, top 300</td><td class="hl">${bt.skaters.model.rho}</td><td>${bt.skaters.v1.rho}</td><td>${bt.skaters.naive.rho}</td></tr>
+    <tr><td>Skaters: ranking agreement, top 150</td><td class="hl">${bt.skaters.model.rho150}</td><td>${bt.skaters.v1.rho150}</td><td>${bt.skaters.naive.rho150}</td></tr>
+    <tr><td>Goalies: points-per-game miss</td><td class="hl">${bt.goalies.model.ppg}</td><td>${bt.goalies.v1.ppg}</td><td>${bt.goalies.naive.ppg}</td></tr>
+    <tr><td>Goalies: season-total miss, top 60</td><td class="hl">${bt.goalies.model.tot}</td><td>${bt.goalies.v1.tot}</td><td>${bt.goalies.naive.tot}</td></tr>
+    <tr><td>Goalies: ranking agreement, top 60</td><td class="hl">${bt.goalies.model.rho}</td><td>${bt.goalies.v1.rho}</td><td>${bt.goalies.naive.rho}</td></tr>
   </tbody></table></div>
-  <p>A typical skater's season total is still off by about ${bt.skaters.model.tot} points, mostly from injuries and role changes nobody can see coming. Goalie totals are the hardest to predict because starting jobs change.</p>
+  <p>The learning step beat step 1 on season totals in ${bt.skaters.wins_tot} of ${bt.skaters.n_seasons} seasons for skaters and ${bt.goalies.wins_tot} of ${bt.goalies.n_seasons} for goalies.</p>
+  <p><b>Against the experts.</b> For ${esc(bt.market.seasons)} we also scored a published preseason top-200/250 ranking the same way. Used alone, the expert list agreed with the final results ${bt.market.skater_market.rho} for skaters (ours: ${bt.market.skater_model.rho}) and ${bt.market.goalie_market.rho} for goalies (ours: ${bt.market.goalie_model.rho}). Blending a little of the market into ours did best (skaters ${bt.market.skater_blend.rho}, goalies ${bt.market.goalie_blend.rho}). That's where the ${Math.round(META.wModel.C * 100)}/${Math.round((1 - META.wModel.C) * 100)} and ${Math.round(META.wModel.G * 100)}/${Math.round((1 - META.wModel.G) * 100)} splits come from. That's only three seasons, so treat the exact split as rough.</p>
+  <p>Hockey is noisy. A typical top-300 skater's season total is still off by about ${Math.round(bt.skaters.model.tot)} points, mostly from injuries and role changes nobody can see coming. Goalie totals are the hardest to predict because starting jobs change.</p>
   <h3>What it doesn't know</h3>
   <ul>
     <li>Line combinations, power-play units and depth charts for 2026-27. Players get credit for their past ice time.</li>
