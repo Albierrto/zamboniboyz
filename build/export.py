@@ -43,27 +43,72 @@ for i, r in allp[allp.get("rookie", False) == True].iterrows():
         allp.at[i, "pts_" + s] = r.proj_pts
 
 # ---- replacement level and value ----
-REPL = {"C": 36, "W": 72, "D": 72, "G": 36}
-repl = {"C": 0, "W": 0, "D": 0, "G": 0}
-for it in range(6):
+REPL = {"C": 36, "W": 72, "D": 72, "G": 30}   # ~3 C, 6 W, 6 D, 2.5 G rostered per team (216 roster spots)
+
+def assign(df, repl):
     best = []
-    for i, r in allp.iterrows():
+    for i, r in df.iterrows():
         opts = [(r["pts_" + s] - repl[s], s) for s in r.slots if pd.notna(r["pts_" + s])]
         best.append(max(opts) if opts else (np.nan, None))
-    allp["value"] = [x[0] for x in best]; allp["slot"] = [x[1] for x in best]
-    new = {}
-    for s, n in REPL.items():
-        pts = allp.loc[allp.slot == s, "pts_" + s].sort_values(ascending=False)
-        new[s] = float(pts.iloc[n - 1]) if len(pts) >= n else 0.0
-    if all(abs(new[s] - repl[s]) < 0.5 for s in repl): repl = new; break
-    repl = new
+    df["value"] = [x[0] for x in best]; df["slot"] = [x[1] for x in best]
+
+def solve_repl(df):
+    repl = {"C": 0, "W": 0, "D": 0, "G": 0}
+    for it in range(8):
+        assign(df, repl)
+        new = {}
+        for s, n in REPL.items():
+            pts = df.loc[df.slot == s, "pts_" + s].sort_values(ascending=False)
+            new[s] = float(pts.iloc[n - 1]) if len(pts) >= n else 0.0
+        done = all(abs(new[s] - repl[s]) < 0.5 for s in repl)
+        repl = new
+        if done: break
+    assign(df, repl)
+    return repl
+
+# 1) goalie calibration: in the backtest, projected goalie totals were too spread out
+#    (top goalies came in lower, depth goalies higher). Fit actual = a + b * projected.
+import calibrate
+CAL = calibrate.goalie_fit()
+print("goalie calibration: actual = %.1f + %.2f x projected" % (CAL["a"], CAL["b"]))
+allp["pts_model_raw"] = np.where(allp.kind.eq("G"), allp.pts_G, np.nan)
+allp["pts_G"] = np.where(allp.kind.eq("G"), CAL["a"] + CAL["b"] * allp.pts_G, np.nan)
+
+# 2) blend with the market. Within each position, a player's market rank (Fantrax ADP) is turned into
+#    points using this league's own scoring: the market's k-th goalie gets our k-th goalie's points.
+#    Our model decides how much a position is worth here; the market helps decide who is good
+#    (it knows depth charts, injuries and team changes that the stats don't).
+W_MODEL = {"C": 0.7, "W": 0.7, "D": 0.7, "G": 0.5}
+solve_repl(allp)
+for s in ["C", "W", "D", "G"]:
+    allp["model_" + s] = allp["pts_" + s]
+allp["prim"] = allp.slot
+allp["market_pts"] = np.nan
+for s in ["C", "W", "D", "G"]:
+    grp = allp[allp.prim == s]
+    ours = np.sort(grp["pts_" + s].values)[::-1]
+    with_adp = grp[grp.adp.notna()].sort_values("adp")
+    no_adp = grp[grp.adp.isna()].sort_values("pts_" + s, ascending=False)
+    order = list(with_adp.index) + list(no_adp.index)
+    for k, idx in enumerate(order):
+        allp.at[idx, "market_pts"] = ours[min(k, len(ours) - 1)]
+w = allp.prim.map(W_MODEL)
+own_pts = allp.apply(lambda r: r["pts_" + r.prim], axis=1)
+delta = (1 - w) * (allp.market_pts - own_pts)
+for s in ["C", "W", "D", "G"]:
+    allp["pts_" + s] = allp["pts_" + s] + delta.where(allp["pts_" + s].notna())
+allp["market_rank_pos"] = np.nan
+for s in ["C", "W", "D", "G"]:
+    grp = allp[(allp.prim == s) & allp.adp.notna()].sort_values("adp")
+    for k, idx in enumerate(grp.index):
+        allp.at[idx, "market_rank_pos"] = k + 1
+
+repl = solve_repl(allp)
 print("replacement:", {k: round(v, 1) for k, v in repl.items()})
-best = []
-for i, r in allp.iterrows():
-    opts = [(r["pts_" + s] - repl[s], s) for s in r.slots if pd.notna(r["pts_" + s])]
-    best.append(max(opts) if opts else (np.nan, None))
-allp["value"] = [x[0] for x in best]; allp["slot"] = [x[1] for x in best]
+allp["proj_pts_final"] = allp.apply(lambda r: r["pts_" + r.slot], axis=1)
+allp["model_pts_slot"] = allp.apply(lambda r: r["model_" + r.slot], axis=1)
 allp = allp[allp.slot.notna()].sort_values("value", ascending=False).reset_index(drop=True)
+allp["model_rank_pos"] = allp.groupby("slot").model_pts_slot.rank(ascending=False, method="first").astype(int)
 
 # ---- owners (kept players) ----
 teams = {k: v["name"] for k, v in league["teamInfo"].items()}
@@ -131,10 +176,20 @@ def chips(r):
         elif r.proj_gs < 35 and not r.no_team: c.append(("bad", "Shares the net or is a backup. Fewer starts means fewer points."))
         if r.gp_last and r.gp_last < 30 and r.proj_gs >= 40:
             c.append(("bad", f"Only {int(r.gp_last)} games last season."))
+    if pd.notna(r.get("market_rank_pos")) and r.get("rookie") != True:
+        pn = {"C": "center", "W": "winger", "D": "defenseman", "G": "goalie"}[r.slot]
+        mr, orank = int(r.market_rank_pos), int(r.model_rank_pos)
+        if mr >= orank + 8 and mr > 6:
+            c.append(("info", f"Our stats like him more than drafters do: they take him as about the {ordinal(mr)} {pn}, we have him {ordinal(orank)}. The market may know something (role, depth chart), so his number is pulled partway toward theirs."))
+        elif orank >= mr + 8 and orank > 6:
+            c.append(("info", f"Drafters like him more than our stats do: about the {ordinal(mr)} {pn} taken vs {ordinal(orank)} for us. His number is pulled partway toward theirs."))
     if pd.notna(r.get("age")):
         if r.age >= 33: c.append(("bad", f"Age {int(r.age)} this season: some decline built in."))
         elif r.age <= 23 and r.get("rookie") != True: c.append(("good", f"Age {int(r.age)} this season: still improving, growth built in."))
     return c
+
+def ordinal(n):
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
 
 def rnd(x, n=1):
     return None if pd.isna(x) else round(float(x), n)
@@ -144,12 +199,14 @@ for i, r in allp.iterrows():
     kind = r.kind
     rookie = r.get("rookie") == True
     p = dict(id=r.fid, n=r["name"] if isinstance(r["name"], str) else r.fname, t=r.team or "", pos=r.elig, slot=r.slot,
-             pts=rnd(r.proj_pts, 0), val=rnd(r.value, 0), adp=rnd(r.adp, 1), own=r.owner if isinstance(r.owner, str) else None,
+             pts=rnd(r.proj_pts_final, 0), val=rnd(r.value, 0),
+             mp=rnd(r.model_pts_slot, 0), mk=rnd(r.market_pts, 0),
+             mr=None if pd.isna(r.market_rank_pos) else int(r.market_rank_pos), orank=int(r.model_rank_pos), adp=rnd(r.adp, 1), own=r.owner if isinstance(r.owner, str) else None,
              age=None if pd.isna(r.get("age")) else int(r.age), rk=1 if rookie else 0, nt=1 if r.no_team else 0,
              ch=chips(r))
     p["slotpts"] = {s: rnd(r["pts_" + s], 0) for s in r.slots if pd.notna(r["pts_" + s])}
     if kind == "S" and not rookie:
-        gp = r.proj_gp; blend = r.proj_pts / (r.ppg * gp) if r.ppg * gp else 1
+        gp = r.proj_gp; blend = r.proj_pts_final / (r.ppg * gp) if r.ppg * gp else 1
         sc = M.SK[r.slot]
         p["gp"] = rnd(gp, 0)
         p["line"] = dict(g=rnd(r.g * gp, 0), a=rnd(r.a * gp, 0), pm=rnd(r.pm * gp, 0), pim=rnd(r.pim * gp, 0), hit=rnd(r.hit * gp, 0),
@@ -160,9 +217,9 @@ for i, r in allp.iterrows():
         p["hist"] = hist_s(r.playerId, r.slot)
         p["pid"] = int(r.playerId)
     elif kind == "G" and not rookie:
-        gp = r.proj_gp; blend = r.proj_pts / (r.ppg * gp) if r.ppg * gp else 1
+        gp = r.proj_gp; blend = r.proj_pts_final / (r.ppg * gp) if r.ppg * gp else 1
         p["gp"] = rnd(gp, 0); p["gs"] = rnd(r.proj_gs, 0)
-        p["gppg"] = rnd(r.proj_pts / gp if gp else r.ppg, 3); p["gpg"] = rnd(r.gs_per_gp, 3)
+        p["gppg"] = rnd(r.proj_pts_final / gp if gp else r.ppg, 3); p["gpg"] = rnd(r.gs_per_gp, 3)
         p["line"] = dict(w=rnd(r.w_pg * gp, 0), sv=rnd(r.sv_pg * gp, 0), ga=rnd(r.ga_pg * gp, 0), so=rnd(r.so_pg * gp, 1), svp=rnd(r.sv_pct, 3))
         brk = {"Wins": 3 * r.w_pg, "Saves": 0.25 * r.sv_pg, "Goals against": -r.ga_pg, "Shutouts": 4 * r.so_pg, "Assists": 2 * r.a_pg}
         p["brk"] = {k: rnd(v * gp * blend, 0) for k, v in brk.items()}
@@ -187,6 +244,7 @@ meta = dict(
     draftDate=draft.get("draftDate"),
     roster=dict(C=2, W=4, D=4, G=2, bench=6, max=18),
     repl={k: round(v, 1) for k, v in repl.items()},
+    replN=REPL, wModel=W_MODEL, gcal=dict(a=round(CAL["a"], 1), b=round(CAL["b"], 2), top12_proj=round(CAL["top12_proj"]), top12_act=round(CAL["top12_act"])),
     scoring=dict(C=M.SK["C"], W=M.SK["W"], D=M.SK["D"], common=M.COMMON, goalie=M.GOALIE),
     periods=len(league["scoringPeriods"]), playoffTeams=league["playoffs"]["numPlayoffTeams"],
     firstPlayoff=league["playoffs"]["firstPlayoffPeriod"], seasonStart=league["startDate"],
