@@ -105,9 +105,38 @@ def attach(d):
     return d
 ps = attach(ps); pg = attach(pg)
 
-# goalie crowding on the goalie's 2026-27 team (Fantrax)
+# ---------- v2: learned corrections (tested on 2015-16..2025-26, see build/lab*.py, build/glab*.py) ----------
+import project2 as P2
+team_now = {int(p): t for p, t in zip(ps.playerId, ps.team) if isinstance(t, str) and t}
+v2s = P2.skaters(team_now)
+for c in M.CATS:
+    ps[c] = ps.playerId.map(v2s["m_" + c]).fillna(ps[c])
+ps["avail"] = ps.playerId.map(v2s.m_share).fillna(ps.avail)
+ps["proj_gp"] = 82 * ps.avail
+
+gteam_now = {int(p): t for p, t in zip(pg.playerId, pg.team) if isinstance(t, str) and t}
+v2g = P2.goalies(gteam_now)
 pg = pg.reset_index(drop=True)
-pg = M.allocate_starts(pg, pd.Series(np.where(pg.no_team, None, pg.team)), M.GP_["cap"], M.GP_["gamma"], incumbent=M.GP_["inc"])
+have = pg.playerId.isin(v2g.index)
+print("goalies with v2 projections:", have.sum(), "of", len(pg))
+g2 = v2g.reindex(pg.playerId)
+g2.index = pg.index
+for c in ["win_rate", "sa_pg", "sv_pct", "so_rate", "a_pg", "pim_pg", "gs_per_gp"]:
+    pg[c] = g2[c].where(have, pg[c])
+base_ppg = 3 * pg.win_rate * pg.gs_per_gp + 0.25 * pg.sa_pg * pg.sv_pct - pg.sa_pg * (1 - pg.sv_pct) + 4 * pg.so_rate * pg.gs_per_gp + 2 * pg.a_pg + 0.5 * pg.pim_pg
+fac = (g2.m_ppg / base_ppg).where(have, 1.0)
+pg["w_pg"] = pg.win_rate * pg.gs_per_gp * fac
+pg["so_pg"] = pg.so_rate * pg.gs_per_gp * fac
+pg["sv_pg"] = pg.sa_pg * pg.sv_pct * fac
+pg["ga_pg"] = pg.sa_pg * (1 - pg.sv_pct) * fac
+pg["a_pg"] = pg.a_pg * fac; pg["pim_pg"] = pg.pim_pg * fac
+pg["ppg"] = g2.m_ppg.where(have, pg.ppg)
+pg["gs_share"] = g2.share_p.where(have, pg.gs_share)
+pg["proj_gs"] = 82 * pg.gs_share
+pg["proj_gp"] = pg.proj_gs / pg.gs_per_gp
+pg["proj_pts"] = pg.ppg * pg.proj_gp
+for c in ["cal_a", "cal_b", "cal_t12p", "cal_t12a"]:
+    pg[c] = float(v2g[c].iloc[0])
 
 # points per game at each eligible slot
 for slot in ["C", "W", "D"]:
@@ -124,7 +153,7 @@ adp_map = {a["id"]: a["ADP"] for a in adp}
 ps["adp"] = ps.fid.map(adp_map); pg["adp"] = pg.fid.map(adp_map)
 
 def adp_curve(d, minw, wcol):
-    e = d[(d[wcol] >= minw) & d.adp.notna() & ~d.no_team]
+    e = d[(d[wcol] >= minw) & d.adp.notna() & (d.adp < 285) & ~d.no_team]
     b, a = np.polyfit(np.log(e.adp), e.proj_pts, 1)
     return lambda x: np.maximum(a + b * np.log(x), 0)
 sk_curve = adp_curve(ps, 60, "wgp"); g_curve = adp_curve(pg, 30, "x_gp")
@@ -146,7 +175,7 @@ print("ADP players with no NHL history:", len(rook), rook[["name", "elig", "team
 # blend limited-history projections toward what their ADP implies
 def blend(d, wcol, lim, curve):
     w = (1 - d[wcol].fillna(0) / lim).clip(0, 1)
-    has = d.adp.notna()
+    has = d.adp.notna() & (d.adp < 285)
     implied = curve(d.adp.fillna(999))
     d["adp_implied"] = np.where(has, implied, np.nan)
     d["proj_pts_model"] = d.proj_pts

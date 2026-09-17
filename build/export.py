@@ -68,8 +68,10 @@ def solve_repl(df):
 
 # 1) goalie calibration: in the backtest, projected goalie totals were too spread out
 #    (top goalies came in lower, depth goalies higher). Fit actual = a + b * projected.
+CAL = dict(a=float(pg.cal_a.iloc[0]), b=float(pg.cal_b.iloc[0]))
 import calibrate
-CAL = calibrate.goalie_fit()
+_old = calibrate.goalie_fit()  # only for the page's "top 12 projected vs actual" note
+CAL["top12_proj"], CAL["top12_act"] = float(pg.cal_t12p.iloc[0]), float(pg.cal_t12a.iloc[0])
 print("goalie calibration: actual = %.1f + %.2f x projected" % (CAL["a"], CAL["b"]))
 allp["pts_model_raw"] = np.where(allp.kind.eq("G"), allp.pts_G, np.nan)
 allp["pts_G"] = np.where(allp.kind.eq("G"), CAL["a"] + CAL["b"] * allp.pts_G, np.nan)
@@ -78,7 +80,8 @@ allp["pts_G"] = np.where(allp.kind.eq("G"), CAL["a"] + CAL["b"] * allp.pts_G, np
 #    points using this league's own scoring: the market's k-th goalie gets our k-th goalie's points.
 #    Our model decides how much a position is worth here; the market helps decide who is good
 #    (it knows depth charts, injuries and team changes that the stats don't).
-W_MODEL = {"C": 0.7, "W": 0.7, "D": 0.7, "G": 0.5}
+ADP_FLOOR = 285   # Fantrax gives never-drafted players an ADP of ~290; treat 285+ as undrafted
+W_MODEL = {"C": 0.8, "W": 0.8, "D": 0.8, "G": 0.6}   # tested against 3 seasons of preseason expert rankings (build/marketlab.py)
 solve_repl(allp)
 for s in ["C", "W", "D", "G"]:
     allp["model_" + s] = allp["pts_" + s]
@@ -87,8 +90,9 @@ allp["market_pts"] = np.nan
 for s in ["C", "W", "D", "G"]:
     grp = allp[allp.prim == s]
     ours = np.sort(grp["pts_" + s].values)[::-1]
-    with_adp = grp[grp.adp.notna()].sort_values("adp")
-    no_adp = grp[grp.adp.isna()].sort_values("pts_" + s, ascending=False)
+    drafted = grp.adp.notna() & (grp.adp < ADP_FLOOR)
+    with_adp = grp[drafted].sort_values("adp")
+    no_adp = grp[~drafted].sort_values("pts_" + s, ascending=False)
     order = list(with_adp.index) + list(no_adp.index)
     for k, idx in enumerate(order):
         allp.at[idx, "market_pts"] = ours[min(k, len(ours) - 1)]
@@ -99,7 +103,7 @@ for s in ["C", "W", "D", "G"]:
     allp["pts_" + s] = allp["pts_" + s] + delta.where(allp["pts_" + s].notna())
 allp["market_rank_pos"] = np.nan
 for s in ["C", "W", "D", "G"]:
-    grp = allp[(allp.prim == s) & allp.adp.notna()].sort_values("adp")
+    grp = allp[(allp.prim == s) & allp.adp.notna() & (allp.adp < ADP_FLOOR)].sort_values("adp")
     for k, idx in enumerate(grp.index):
         allp.at[idx, "market_rank_pos"] = k + 1
 
@@ -250,15 +254,7 @@ meta = dict(
     firstPlayoff=league["playoffs"]["firstPlayoffPeriod"], seasonStart=league["startDate"],
     defaultTeam="bx8lngpymo5yu9nq",
 )
-import backtest as B, backtest_g as BG
-nv = B.naive(); md = B.evaluate(M.P)
-gn = BG.ev(None, naive=True); gm = BG.ev(M.GP_)
-meta["backtest"] = dict(
-    skaters=dict(naive=dict(ppg=round(nv.mae_ppg, 2), tot=round(nv.mae_tot300), rho=round(nv.rho300, 2)),
-                 model=dict(ppg=round(md.mae_ppg, 2), tot=round(md.mae_tot300), rho=round(md.rho300, 2))),
-    goalies=dict(naive=dict(ppg=round(gn.mae_ppg, 2), tot=round(gn.mae_tot60), rho=round(gn.rho60, 2)),
-                 model=dict(ppg=round(gm.mae_ppg, 2), tot=round(gm.mae_tot60), rho=round(gm.rho60, 2))),
-    seasons="2023-24, 2024-25 and 2025-26")
+meta["backtest"] = json.load(open("data/report.json"))
 meta["adpNote"] = "Fantrax average draft position across all Fantrax NHL drafts, as of " + datetime.date.today().isoformat()
 import os; os.makedirs("site/data", exist_ok=True)
 with open("site/data/board.js", "w") as f:
