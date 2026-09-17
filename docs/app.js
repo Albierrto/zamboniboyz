@@ -29,7 +29,7 @@ let EXTRA = null; // lazily loaded Fantrax name list for players not on the boar
 const S = {
   team: TEAMS[LS.get("zb-team", "")] ? LS.get("zb-team") : META.defaultTeam,
   tab: LS.get("zb-tab", "board"),
-  pos: "ALL", q: "", hideTaken: LS.get("zb-hide", true), sort: "val", show: 60, open: null,
+  pos: "ALL", q: "", hideTaken: LS.get("zb-hide", true), sort: "best", show: 60, open: null,
   stars: LS.get("zb-stars", {}),
   manual: LS.get("zb-manual", {}), // fantrax id -> overall pick number
   gsOv: LS.get("zb-gs", {}),       // goalie id -> starts
@@ -103,6 +103,7 @@ function face(p, cls = "face") {
   if (!p.pid) return `<div class="${cls} ph" aria-hidden="true">${ini}</div>`;
   return `<img class="${cls}" loading="lazy" alt="" src="https://assets.nhle.com/mugs/nhl/latest/${p.pid}.png" onerror="this.outerHTML='<div class=&quot;${cls} ph&quot;>${ini}</div>'">`;
 }
+function ordinal(n) { const s = n % 100 >= 11 && n % 100 <= 13 ? "th" : ({ 1: "st", 2: "nd", 3: "rd" })[n % 10] || "th"; return n + s; }
 function posBadge(p) { return `<span class="pos">${esc((p.pos || p.slot).replace(/,/g, "/"))}</span>`; }
 
 /* ---------------- draft state ---------------- */
@@ -206,26 +207,38 @@ function fillLineup(list) {
 }
 
 /* ---------------- suggestions ---------------- */
-function suggestions(st, avail, lu) {
+function scoreAll(st, avail, lu) {
   // can he be had at the pick being decided, and will he last to the pick after it?
   const oddsNow = lastOdds(avail, st.onClock ? 0 : st.nextBefore);
   const oddsAfter = st.after ? lastOdds(avail, st.afterBefore) : null;
-  const pool = avail.filter((p) => valOf(p) != null && !p.nt);
-  const bestVal = Math.max(...pool.map((p) => valOf(p)));
+  const pool = avail.filter((p) => valOf(p) != null);
   const open = Object.values(lu.needs).reduce((a, b) => a + b, 0);
+  const map = new Map();
   const scored = pool.map((p) => {
     const fillS = elig(p).filter((s) => lu.needs[s] > 0).sort((a, b) => valAt(p, b) - valAt(p, a))[0];
     const v = fillS ? valAt(p, fillS) : valOf(p);
-    const now = oddsNow.get(p.id) ?? 1;
+    const now = st.next ? oddsNow.get(p.id) ?? 1 : 1;
     const later = oddsAfter ? oddsAfter.get(p.id) ?? 1 : 0;
     let score = v;
     if (open > 0 && !fillS) score -= 40;
-    // a player who will very likely still be there next time is worth less to take now
-    score *= 1 - 0.6 * later;
-    // and a player who probably won't make it to your pick is less useful to plan around
-    score *= 0.5 + 0.5 * now;
-    return { p, score, v, fillS, now, later };
+    if (score > 0) {
+      // a player who will very likely still be there next time is worth less to take now
+      score *= 1 - 0.6 * later;
+      // and a player who probably won't make it to your pick is less useful to plan around
+      score *= 0.5 + 0.5 * now;
+    }
+    if (p.nt) score -= 1000;
+    const x = { p, score, v, fillS, now, later };
+    map.set(p.id, x);
+    return x;
   }).sort((a, b) => b.score - a.score);
+  return { scored, map, open };
+}
+function suggestions(st, avail, lu, ctx) {
+  ctx = ctx || scoreAll(st, avail, lu);
+  const { open } = ctx;
+  const scored = ctx.scored.filter((x) => !x.p.nt);
+  const bestVal = Math.max(...scored.map((x) => valOf(x.p)));
   return scored.slice(0, 3).map((x, i) => {
     const why = [];
     if (Math.round(valOf(x.p)) >= Math.round(bestVal)) why.push({ t: "Most value left on the board" });
@@ -284,7 +297,7 @@ function boardShell() {
         <input id="q" type="search" placeholder="Find a player" autocomplete="off" aria-label="Find a player"><button class="clr" id="qclr" aria-label="Clear search" hidden>×</button></div>
       <div class="chips" id="posChips" role="group" aria-label="Position"></div>
       <select class="sel" id="sortSel" aria-label="Sort by">
-        <option value="val">Best value</option><option value="pts">Most points</option><option value="adp">Where others draft him (ADP)</option>
+        <option value="best">Best pick for you now</option><option value="val">Most value</option><option value="pts">Most points</option><option value="adp">Where drafters take him</option>
       </select>
       <label class="chk"><input type="checkbox" id="hideTaken"> Hide taken</label>
     </div>
@@ -299,7 +312,7 @@ function boardShell() {
   $("#list").addEventListener("click", onListClick);
   $("#sug").addEventListener("click", (e) => {
     const b = e.target.closest("[data-open]"); if (!b) return;
-    S.open = b.dataset.open; S.q = ""; $("#q").value = ""; S.pos = "ALL"; S.sort = "val"; renderBoard();
+    S.open = b.dataset.open; S.q = ""; $("#q").value = ""; S.pos = "ALL"; renderBoard();
     let c = document.querySelector(`.card[data-id="${CSS.escape(S.open)}"]`);
     if (!c) { S.q = player(S.open).n; $("#q").value = S.q; $("#qclr").hidden = false; renderBoardList(); c = document.querySelector(`.card[data-id="${CSS.escape(S.open)}"]`); }
     if (c) c.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -316,7 +329,8 @@ function renderBoard() {
   else if (!st.made && !st.done) ban = `<div class="banner">Each team already has its <b>${Object.keys(st.taken).length / 12 | 0} keepers</b>, so they're off the board. When the draft starts, players drop off by themselves as picks come in from Fantrax.</div>`;
   $("#boardBanner").innerHTML = ban;
   // suggestions
-  const sg = st.done || !st.next ? [] : suggestions(st, avail, lu);
+  const ctx = scoreAll(st, avail, lu);
+  const sg = st.done || !st.next ? [] : suggestions(st, avail, lu, ctx);
   $("#sugTitle").hidden = !sg.length;
   $("#sugTitle").textContent = st.onClock ? "You're up. Best picks right now" : st.next ? `Best targets for your pick at #${st.next.n}` : "Best available";
   $("#sug").innerHTML = sg.map((x) => `
@@ -331,15 +345,16 @@ function renderBoard() {
   $("#posChips").innerHTML = chips.map(([k, l]) => `<button data-pos="${k}" aria-pressed="${S.pos === k}" ${k === "STAR" ? 'aria-label="Starred players"' : ""}>${l}${lu.needs[k] > 0 ? `<span class="need" title="Open starting spots">${lu.needs[k]}</span>` : ""}</button>`).join("");
   $("#posChips").onclick = (e) => { const b = e.target.closest("button"); if (!b) return; S.pos = b.dataset.pos; S.show = 60; renderBoard(); };
   $("#sortSel").value = S.sort;
-  renderBoardList(st, avail, odds);
+  renderBoardList(st, avail, odds, ctx);
 }
 function posLine(p) {
   return `<span class="nodot">${posBadge(p)} ${esc(p.t || "No team")}${p.age ? ` · age ${p.age}` : ""} · <span class="pill tier" style="--tc:var(--t${tierOf(valOf(p))})">${TIER[tierOf(valOf(p))]}</span></span>`;
 }
-function renderBoardList(st, avail, odds) {
+function renderBoardList(st, avail, odds, ctx) {
   st = st || draftState();
   avail = avail || available(st);
   odds = odds || lastOdds(avail, st.before);
+  ctx = ctx || scoreAll(st, avail, fillLineup(rosterOf(S.team, st)));
   const q = fold(S.q).trim();
   let rows = (S.hideTaken ? avail : B.players).slice();
   if (S.pos === "STAR") rows = rows.filter((p) => S.stars[p.id]);
@@ -350,11 +365,12 @@ function renderBoardList(st, avail, odds) {
   }
   const key = S.pos === "ALL" || S.pos === "STAR" ? "ALL" : S.pos;
   const sorters = {
+    best: (a, b) => (ctx.map.get(b.id)?.score ?? (valOf(b) ?? -999) - 2000) - (ctx.map.get(a.id)?.score ?? (valOf(a) ?? -999) - 2000),
     val: (a, b) => (valAt(b, key) ?? -999) - (valAt(a, key) ?? -999),
     pts: (a, b) => ((key === "ALL" ? ptsOf(b) : ptsAt(b, key)) ?? -1) - ((key === "ALL" ? ptsOf(a) : ptsAt(a, key)) ?? -1),
     adp: (a, b) => (a.adp ?? 999) - (b.adp ?? 999),
   };
-  rows.sort(sorters[S.sort]);
+  rows.sort(sorters[S.sort] || sorters.best);
   const list = $("#list");
   if (!rows.length) {
     list.innerHTML = `<div class="empty">${S.pos === "STAR" ? "No starred players yet. Tap the star on any player to build your short list." : q ? "No player matches that search." : "Nobody left here."}</div>`;
@@ -364,7 +380,7 @@ function renderBoardList(st, avail, odds) {
   list.innerHTML = rows.slice(0, S.show).map((p) => {
     const t = st.taken[p.id];
     if (!t) availRank++;
-    return cardHTML(p, t, t ? "" : availRank, odds.get(p.id), st, key);
+    return cardHTML(p, t, t ? "" : availRank, odds.get(p.id), st, key, ctx.map.get(p.id));
   }).join("");
   $("#more").hidden = rows.length <= S.show;
   $("#more").textContent = `Show more (${rows.length - S.show} left)`;
@@ -375,7 +391,7 @@ function takenText(t) {
   if (t.team) return `${t.manual ? "Marked taken" : "Drafted"} by ${tname(t.team)}, pick #${t.pick}`;
   return "Marked as taken";
 }
-function cardHTML(p, t, rank, odd, st, key) {
+function cardHTML(p, t, rank, odd, st, key, sc) {
   const v = valAt(p, key);
   const tier = tierOf(v);
   const mine = t && t.team === S.team;
@@ -383,7 +399,12 @@ function cardHTML(p, t, rank, odd, st, key) {
   const tags = [];
   if (t) tags.push(`<span class="tag ${mine ? "warn" : ""}"><b>${esc(takenText(t))}</b></span>`);
   if (v != null) tags.push(`<span class="tag ${v >= 0 ? "good" : "bad"}" title="Points above the best player you could get on waivers at his position"><b>${sgn(v)}</b> value</span>`);
-  if (p.adp != null) tags.push(`<span class="tag" title="Average draft position across Fantrax leagues">ADP <b>${fmt(p.adp)}</b></span>`);
+  if (!t && sc && st.after && !st.done && sc.v > 0) {
+    if (sc.later < 0.35) tags.push(`<span class="pill gold" title="Probably gone before your pick at #${st.after.n}">Take soon</span>`);
+    else if (sc.later > 0.8) tags.push(`<span class="pill good" title="Likely still there at your pick #${st.after.n}">Can wait</span>`);
+  }
+  if (p.adp != null) tags.push(`<span class="tag" title="Average draft position across Fantrax drafts">Drafted ~<b>#${fmt(p.adp)}</b></span>`);
+  else if (!p.own) tags.push(`<span class="tag" title="Not in Fantrax's average draft positions">Usually <b>undrafted</b></span>`);
   if (!t && odd != null && st.horizon && !st.done) {
     const c = odd >= 0.7 ? "var(--good)" : odd >= 0.4 ? "var(--gold)" : "var(--bad)";
     tags.push(`<span class="odds" title="Chance he is still available at your pick #${st.horizon.n}">Left at #${st.horizon.n} <i style="--w:${pct(odd)};--oc:${c}"></i><b>${pct(odd)}</b></span>`);
@@ -412,6 +433,10 @@ function detailHTML(p, t, st) {
   const v = valOf(p);
   let lead = "";
   if (v != null) lead = `<li class="info">${v >= 0 ? `About <b>${Math.round(v)}</b> more points than the best ${POSNAME[p.slot].toLowerCase()} you could grab off waivers.` : `Projects below a typical waiver-wire ${POSNAME[p.slot].toLowerCase()} in this league.`}</li>`;
+  if (p.mp != null && p.mk != null && !p.rk) {
+    const pn = POSNAME[p.slot].toLowerCase();
+    lead += `<li class="info">Our stats say <b>${fmt(p.mp)}</b> points. Where drafters take him (${p.mr ? ordinal(p.mr) + " " + pn : "rarely drafted"}) works out to about <b>${fmt(p.mk)}</b> in this scoring. His number, <b>${fmt(p.pts)}</b>, blends the two${p.slot === "G" ? " half and half" : ", mostly ours"}.</li>`;
+  }
   if (p.unknown) lead = `<li class="info">Not in this board's player list, so there's no projection for him.</li>`;
   parts.push(`<div><h4>Why</h4><ul class="why">${lead}${why}</ul></div>`);
   if (p.brk) {
@@ -480,7 +505,8 @@ function rerenderCard(id) {
     const rank = c.querySelector(".rank").textContent;
     const key = S.pos === "ALL" || S.pos === "STAR" ? "ALL" : S.pos;
     const tmp = document.createElement("div");
-    tmp.innerHTML = cardHTML(p, t, rank, odds.get(pid), st, key);
+    const lu = fillLineup(rosterOf(S.team, st));
+    tmp.innerHTML = cardHTML(p, t, rank, odds.get(pid), st, key, scoreAll(st, avail, lu).map.get(pid));
     c.replaceWith(tmp.firstElementChild);
   });
 }
@@ -616,15 +642,20 @@ function renderHow() {
   </ul>
 
   <h3>Value and tiers</h3>
-  <p><b>Value</b> is how many more points a player should score than the best player you could pick up off waivers at his position. With 12 teams, that waiver-level player is roughly the 36th-best center, the 72nd-best winger, the 72nd-best defenseman and the 36th-best goalie. Right now that's about ${Math.round(REPL.C)} points for a center, ${Math.round(REPL.W)} for a winger, ${Math.round(REPL.D)} for a defenseman and ${Math.round(REPL.G)} for a goalie. That's why a 350-point center can be worth less than a 250-point defenseman.</p>
+  <p><b>Value</b> is how many more points a player should score than the best player you could pick up off waivers at his position. With 12 teams and 18-man rosters, that waiver-level player is roughly the ${ordinal(META.replN.C)}-best center, the ${ordinal(META.replN.W)}-best winger, the ${ordinal(META.replN.D)}-best defenseman and the ${ordinal(META.replN.G)}-best goalie. Streaming around that is limited here: the league allows only 3 free-agent pickups a week, and each pickup and drop costs a fee. Right now that's about ${Math.round(REPL.C)} points for a center, ${Math.round(REPL.W)} for a winger, ${Math.round(REPL.D)} for a defenseman and ${Math.round(REPL.G)} for a goalie. That's why a 350-point center can be worth less than a 250-point defenseman.</p>
   <p>Tiers by value: <span class="pill tier" style="--tc:var(--t1)">Elite</span> 120+ · <span class="pill tier" style="--tc:var(--t2)">Great</span> 80–119 · <span class="pill tier" style="--tc:var(--t3)">Very good</span> 50–79 · <span class="pill tier" style="--tc:var(--t4)">Solid</span> 20–49 · <span class="pill tier" style="--tc:var(--t5)">Depth</span> 0–19 · <span class="pill tier" style="--tc:var(--t6)">Waiver level</span> below 0.</p>
+
+  <h3>Our stats vs. where drafters take players</h3>
+  <p>Our projections only know past stats. Drafters know things stats don't, like a new backup taking starts, a team that got worse, or a player moving up to the top line. So every player's number is a blend. Our stats set how much each position is worth in <i>this</i> league's scoring. Where Fantrax drafters take him sets how good he is compared with other players at his position. Skaters are ${Math.round(META.wModel.C * 100)}% our stats and ${Math.round((1 - META.wModel.C) * 100)}% drafters. Goalies are half and half, because goalie projections are the least reliable.</p>
+  <p>Goalies also get one more fix. When we tested past seasons, the goalies we projected highest scored less than projected and backup-level goalies scored more (our top 12 averaged ${META.gcal.top12_proj} projected points but ${META.gcal.top12_act} actual). So goalie totals are pulled toward the middle before anything else happens.</p>
+  <p>The draft board starts in <b>Best pick for you now</b> order. That's value, adjusted for whether a player fills an open starting spot and whether he's likely to last until your next turn. <span class="pill gold">Take soon</span> means he'll probably be gone before your following pick. <span class="pill good">Can wait</span> means he'll probably still be there, so you can grab someone else first. Switch to <b>Most value</b> to see the pure ranking.</p>
 
   <h3>“Left at your pick”</h3>
   <p>The chance a player is still there at your next pick. It uses his Fantrax ADP (average draft position across Fantrax leagues) compared with the other players still available, and how many picks happen before yours. Treat it as a guide. Your leaguemates don't all draft by ADP.</p>
   <p><b>Best for you right now</b> starts with value, gives a boost to players who fill an open starting spot, and adds a small nudge for players who probably won't last until your next pick.</p>
 
   <h3>Live picks</h3>
-  <p>While the page is open, it checks Fantrax for new picks every few seconds during the draft (every couple of minutes otherwise). Players disappear from the board as soon as Fantrax lists them. If Fantrax is slow or down, open a player and tap <b>Mark as drafted</b>. Fantrax's list takes over again once it catches up. Your stars, hand-marked picks and goalie starts are saved only in this browser. This page only reads from Fantrax and can't change anything in your league.</p>
+  <p>The draft order is the same every round (not a snake), with traded picks going to their new owners, and each pick has a 2-minute clock. While the page is open, it checks Fantrax for new picks every few seconds during the draft (every couple of minutes otherwise). Players disappear from the board as soon as Fantrax lists them. If Fantrax is slow or down, open a player and tap <b>Mark as drafted</b>. Fantrax's list takes over again once it catches up. Your stars, hand-marked picks and goalie starts are saved only in this browser. This page only reads from Fantrax and can't change anything in your league.</p>
 
   <h3>How accurate is it?</h3>
   <p>We tested the method the honest way: projected each of the last three seasons (${esc(bt.seasons)}) using only the seasons before it, then compared the results with what actually happened. The comparison is simply using last season's numbers again.</p>
@@ -641,7 +672,9 @@ function renderHow() {
   <ul>
     <li>Line combinations, power-play units and depth charts for 2026-27. Players get credit for their past ice time.</li>
     <li>Injuries that happen after the season starts, and contract news after ${esc(META.built.slice(0, 10))}.</li>
-    <li>How your leaguemates value players. ADP is the best general guide.</li>
+    <li>How your leaguemates value players. ADP is the best general guide, but it comes from all Fantrax NHL drafts, most with different scoring.</li>
+    <li>Keeper value. This is a 7-keeper league, and the numbers are for 2026-27 only. Young players are worth a little more to you than they show here.</li>
+    <li>The blend between our stats and drafters' picks is a judgment call. There's no past ADP data to test it against.</li>
   </ul>
   </div>`;
 }
