@@ -226,11 +226,15 @@ function scoreAll(st, avail, lu) {
   const roster = rosterOf(S.team, st);
   const pool = avail.filter((p) => valOf(p) != null);
   const map = new Map();
+  const picksLeft = st.picks.filter((p) => !p.pid && p.team === S.team).length;
+  const openStarters = Object.values(lu.needs).reduce((a, b) => a + b, 0);
+  const slack = picksLeft - openStarters;            // bench picks you can still afford
+  const mustFill = picksLeft > 0 && slack <= 0;
   const items = pool.map((p) => {
     const m = marginal(roster, p, lu);
     const now = st.next ? oddsNow.get(p.id) ?? 1 : 1;
     const later = oddsAfter ? oddsAfter.get(p.id) ?? 1 : 0;
-    return { p, gain: m.gain, slot: m.slot, primary: p.slot, now, later, starts: !!m.slot };
+    return { p, gain: m.gain, slot: m.slot, primary: p.slot, now, later, starts: !!m.slot, fillsOpen: !!m.slot && lu.needs[m.slot] > 0 };
   });
   // the fallback at each position: what you'd expect to get there at your next pick if you pass now.
   // Expected best available = walk the candidates from best down, each weighted by the chance he's still there.
@@ -254,17 +258,19 @@ function scoreAll(st, avail, lu) {
     const dropoff = x.gain - fbGain;
     let score = x.gain - DROP_W * fbGain;
     if (!st.onClock) score *= 0.5 + 0.5 * x.now;   // planning ahead: weight by the chance he's there
+    if (mustFill && !x.fillsOpen) score -= 500;        // no room left: he has to fill one of the open starting spots
+    else if (slack === 1 && !x.fillsOpen) score *= 0.6; // one spare pick left: lean toward filling the open spots
     if (x.p.nt) score -= 1000;
     const out = { ...x, score, fb: fb && fb.named ? fb.named : null, fbE: fbGain, dropoff };
     map.set(x.p.id, out);
     return out;
   }).sort((a, b) => b.score - a.score);
-  return { scored, map, fallback };
+  return { scored, map, fallback, picksLeft, openStarters, slack, mustFill, needs: lu.needs };
 }
 const DROP_W = 0.5;
 function suggestions(st, avail, lu, ctx) {
   ctx = ctx || scoreAll(st, avail, lu);
-  const all = ctx.scored.filter((x) => !x.p.nt);
+  const all = ctx.scored.filter((x) => !x.p.nt && !(ctx.mustFill && !x.fillsOpen));
   // when planning ahead, the main cards are players with a real chance to be there; long shots go in their own strip
   const likely = st.onClock ? all : all.filter((x) => x.now >= 0.25);
   const bestGain = Math.max(...likely.map((x) => x.gain));
@@ -277,7 +283,8 @@ function suggestions(st, avail, lu, ctx) {
     const why = [];
     const pn = POSNAME[x.primary].toLowerCase();
     if (Math.round(x.gain) >= Math.round(bestGain)) why.push({ t: "Biggest boost to your lineup of anyone likely there" });
-    if (x.slot && x.slot !== x.primary) why.push({ t: `Would start at ${POSNAME[x.slot].toLowerCase()} for you` });
+    if (x.slot && ctx.mustFill) why.push({ t: `Fills one of your ${ctx.openStarters} open starting spot${ctx.openStarters > 1 ? "s" : ""} (${ctx.picksLeft} pick${ctx.picksLeft > 1 ? "s" : ""} left)` });
+    else if (x.slot && x.slot !== x.primary) why.push({ t: `Would start at ${POSNAME[x.slot].toLowerCase()} for you` });
     else if (x.slot) why.push({ t: `Would start at ${pn} for you` });
     else why.push({ t: `Bench for now: your ${pn} starters are set`, w: 1 });
     if (st.after) {
@@ -294,7 +301,8 @@ function suggestions(st, avail, lu, ctx) {
   // long shots: better than the top card but unlikely to be there
   const topScore = pick3.length ? pick3[0].score / (0.5 + 0.5 * pick3[0].now) : -1;
   const longshots = st.onClock ? [] : all.filter((x) => x.now < 0.25 && x.gain - DROP_W * x.fbE > topScore).slice(0, 4);
-  return { cards, longshots };
+  const needTxt = Object.entries(ctx.needs).filter(([, n]) => n > 0).map(([s, n]) => `${n} ${s}`).join(", ");
+  return { cards, longshots, needTxt, picksLeft: ctx.picksLeft, openStarters: ctx.openStarters, mustFill: ctx.mustFill, slack: ctx.slack };
 }
 
 /* ---------------- clock strip ---------------- */
@@ -371,15 +379,19 @@ function renderBoard() {
   const lu = fillLineup(rosterOf(S.team, st));
   // banner
   let ban = "";
-  if (S.live.err && !S.live.at) ban = `<div class="banner err"><b>Can't reach Fantrax right now.</b> The board still works: open a player and tap <b>Mark as drafted</b> when someone takes him.</div>`;
+  if (S.live.err && !S.live.at) ban = `<div class="banner err"><b>Can't reach Fantrax right now.</b> The board still works: tap <b>Enter pick</b> at the bottom, or <b>Taken</b> on a player, when someone is drafted.</div>`;
   else if (!st.made && !st.done) ban = `<div class="banner">Each team already has its <b>${Object.keys(st.taken).length / 12 | 0} keepers</b>, so they're off the board. When the draft starts, players drop off by themselves as picks come in from Fantrax.</div>`;
-  $("#boardBanner").innerHTML = ban;
   // suggestions
   const ctx = scoreAll(st, avail, lu);
   const sug = st.done || !st.next ? { cards: [], longshots: [] } : suggestions(st, avail, lu, ctx);
   const sg = sug.cards;
   $("#sugTitle").hidden = !sg.length;
   $("#sugTitle").textContent = st.onClock ? "You're up. Best picks right now" : st.next ? `Best targets for your pick at #${st.next.n}` : "Best available";
+  if (sg.length) {
+    const need = sug.needTxt ? `Still need: ${sug.needTxt}` : "Every starting spot is filled";
+    ban += `<div class="banner ${sug.mustFill ? "" : "soft"}">${sug.mustFill ? `<b>${sug.picksLeft} pick${sug.picksLeft > 1 ? "s" : ""} left for ${sug.openStarters} open starting spot${sug.openStarters > 1 ? "s" : ""}.</b> Only players who fill one are suggested now. ` : ""}${need} · ${sug.picksLeft} pick${sug.picksLeft === 1 ? "" : "s"} left${!sug.mustFill && sug.slack > 0 ? ` · room for ${sug.slack} bench pick${sug.slack > 1 ? "s" : ""}` : ""}</div>`;
+  }
+  $("#boardBanner").innerHTML = ban;
   $("#sug").innerHTML = sg.map((x) => `
     <button class="sug" data-open="${esc(x.p.id)}">
       ${face(x.p)}
@@ -853,6 +865,7 @@ function renderHow() {
     <li><b>What would you get at that position if you wait until your next pick?</b> Using where drafters usually take players, it works out who's likely to still be there next time and what they're worth. Half of that expected fallback is subtracted. So a player at a deep position (lots of similar guys behind him) scores lower than one at a thin position, and a player you can probably get later scores lower than one you can't.</li>
   </ul>
   <p>Before your pick, the cards also weigh in the chance he's still there when you're up, and the strip below them lists better players who'd be worth taking instead if they happen to fall. When you're on the clock, it's just the two questions above. <span class="pill gold">Take soon</span> means he'll probably be gone before your following pick. <span class="pill good">Can wait</span> means he'll probably still be there. Switch to <b>Most value</b> to see the pure ranking.</p>
+  <p><b>Finishing your roster.</b> The banner above the cards tracks which starting spots are still open and how many picks you have left. While you have spare picks, a great bench player can still be the pick. Once your remaining picks only just cover your open starting spots, only players who fill one are suggested, so you never end the draft without, say, a second goalie. Rosters and picks refresh from Fantrax on their own; nothing here needs a manual update.</p>
   <p class="note">Close calls are close: when the top three are within a few points of each other, the method is telling you it's a coin flip, and things it can't see (a line change, a new coach, your gut) should decide it.</p>
 
   <h3>“Left at your pick”</h3>
