@@ -201,10 +201,21 @@ function fillLineup(list) {
   }
   const needs = {};
   for (const s of ["C", "W", "D", "G"]) needs[s] = CAP[s] - slots[s].length;
-  let strength = 0;
-  for (const s of ["C", "W", "D", "G"]) for (const x of slots[s]) strength += ptsAt(x.p, x.s) || 0;
+  let strength = 0, raw = 0;
+  for (const s of ["C", "W", "D", "G"]) for (const x of slots[s]) { raw += ptsAt(x.p, x.s) || 0; strength += (ptsAt(x.p, x.s) || 0) - REPL[s]; }
+  // bench: with daily lineups a bench player plays when a starter at his position is off, so count him at half
+  const benchVal = bench.map((p) => Math.max(0, valOf(p) ?? 0)).sort((a, b) => b - a).slice(0, BENCH);
+  strength += BENCH_W * benchVal.reduce((a, b) => a + b, 0);
+  const slotOf = {};
+  for (const s of ["C", "W", "D", "G"]) for (const x of slots[s]) slotOf[x.p.id] = s;
   const benchPts = bench.slice(0, BENCH).reduce((a, p) => a + (ptsOf(p) || 0), 0);
-  return { slots, bench, needs, strength: strength + 0.25 * benchPts, starters: strength };
+  return { slots, bench, needs, strength, starters: raw, raw: raw + 0.5 * benchPts, slotOf };
+}
+const BENCH_W = 0.5;
+function marginal(roster, p, base) {
+  // how much stronger the lineup gets (in points over waiver level) if p joins it, letting others shift positions
+  const lu = fillLineup(roster.concat([p]));
+  return { gain: lu.strength - base.strength, slot: lu.slotOf[p.id] || null };
 }
 
 /* ---------------- suggestions ---------------- */
@@ -212,53 +223,78 @@ function scoreAll(st, avail, lu) {
   // can he be had at the pick being decided, and will he last to the pick after it?
   const oddsNow = lastOdds(avail, st.onClock ? 0 : st.nextBefore);
   const oddsAfter = st.after ? lastOdds(avail, st.afterBefore) : null;
+  const roster = rosterOf(S.team, st);
   const pool = avail.filter((p) => valOf(p) != null);
-  const open = Object.values(lu.needs).reduce((a, b) => a + b, 0);
   const map = new Map();
-  const scored = pool.map((p) => {
-    const fillS = elig(p).filter((s) => lu.needs[s] > 0).sort((a, b) => valAt(p, b) - valAt(p, a))[0];
-    const v = fillS ? valAt(p, fillS) : valOf(p);
+  const items = pool.map((p) => {
+    const m = marginal(roster, p, lu);
     const now = st.next ? oddsNow.get(p.id) ?? 1 : 1;
     const later = oddsAfter ? oddsAfter.get(p.id) ?? 1 : 0;
-    let score = v;
-    if (open > 0 && !fillS) score -= 40;
-    if (score > 0) {
-      // a player who will very likely still be there next time is worth less to take now
-      score *= 1 - 0.6 * later;
-      // and a player who probably won't make it to your pick is less useful to plan around
-      score *= 0.5 + 0.5 * now;
+    return { p, gain: m.gain, slot: m.slot, primary: p.slot, now, later, starts: !!m.slot };
+  });
+  // the fallback at each position: what you'd expect to get there at your next pick if you pass now.
+  // Expected best available = walk the candidates from best down, each weighted by the chance he's still there.
+  const fallback = {};
+  if (st.after) {
+    for (const s of ["C", "W", "D", "G"]) {
+      const cands = items.filter((x) => x.primary === s && x.gain > 0 && !x.p.nt).sort((a, b) => b.gain - a.gain);
+      let e = 0, alive = 1, named = null;
+      for (const c of cands) {
+        e += alive * c.later * c.gain;
+        if (!named && c.later >= 0.5) named = c;
+        alive *= 1 - c.later;
+        if (alive < 0.02) break;
+      }
+      fallback[s] = { e, named: named || cands.find((c) => c.later >= 0.25) || null };
     }
-    if (p.nt) score -= 1000;
-    const x = { p, score, v, fillS, now, later };
-    map.set(p.id, x);
-    return x;
+  }
+  const scored = items.map((x) => {
+    const fb = st.after && fallback[x.primary] ? fallback[x.primary] : null;
+    const fbGain = fb ? fb.e : 0;
+    const dropoff = x.gain - fbGain;
+    let score = x.gain - DROP_W * fbGain;
+    if (!st.onClock) score *= 0.5 + 0.5 * x.now;   // planning ahead: weight by the chance he's there
+    if (x.p.nt) score -= 1000;
+    const out = { ...x, score, fb: fb && fb.named ? fb.named : null, fbE: fbGain, dropoff };
+    map.set(x.p.id, out);
+    return out;
   }).sort((a, b) => b.score - a.score);
-  return { scored, map, open };
+  return { scored, map, fallback };
 }
+const DROP_W = 0.5;
 function suggestions(st, avail, lu, ctx) {
   ctx = ctx || scoreAll(st, avail, lu);
-  const { open } = ctx;
-  const scored = ctx.scored.filter((x) => !x.p.nt);
-  const bestVal = Math.max(...scored.map((x) => valOf(x.p)));
-  // show a mix: if the top three are all one position, swap the third for the best at another position
-  let pick3 = scored.slice(0, 3);
-  if (pick3.length === 3 && pick3.every((x) => x.p.slot === pick3[0].p.slot)) {
-    const alt = scored.find((x) => x.p.slot !== pick3[0].p.slot);
+  const all = ctx.scored.filter((x) => !x.p.nt);
+  // when planning ahead, the main cards are players with a real chance to be there; long shots go in their own strip
+  const likely = st.onClock ? all : all.filter((x) => x.now >= 0.25);
+  const bestGain = Math.max(...likely.map((x) => x.gain));
+  let pick3 = likely.slice(0, 3);
+  if (pick3.length === 3 && pick3.every((x) => x.primary === pick3[0].primary)) {
+    const alt = likely.find((x) => x.primary !== pick3[0].primary);
     if (alt) pick3 = [pick3[0], pick3[1], alt];
   }
-  return pick3.map((x, i) => {
+  const cards = pick3.map((x, i) => {
     const why = [];
-    if (Math.round(valOf(x.p)) >= Math.round(bestVal)) why.push({ t: "Most value left on the board" });
-    if (x.fillS) why.push({ t: `Fills an open ${POSNAME[x.fillS].toLowerCase()} spot (you need ${lu.needs[x.fillS]} more)` });
-    else if (open > 0) why.push({ t: "Bench depth: your starting spots at his position are full", w: 1 });
-    if (!st.onClock && st.next && x.now < 0.6) why.push({ t: `Only ${pct(x.now)} chance he makes it to #${st.next.n}`, w: 1 });
+    const pn = POSNAME[x.primary].toLowerCase();
+    if (Math.round(x.gain) >= Math.round(bestGain)) why.push({ t: "Biggest boost to your lineup of anyone likely there" });
+    if (x.slot && x.slot !== x.primary) why.push({ t: `Would start at ${POSNAME[x.slot].toLowerCase()} for you` });
+    else if (x.slot) why.push({ t: `Would start at ${pn} for you` });
+    else why.push({ t: `Bench for now: your ${pn} starters are set`, w: 1 });
     if (st.after) {
-      if (x.later < 0.35) why.push({ t: `Won't last: ${pct(1 - x.later)} chance he's gone by #${st.after.n}`, w: 1 });
-      else if (x.later > 0.8) why.push({ t: `Could wait: likely still there at #${st.after.n} (${pct(x.later)})` });
+      const same = x.fb && x.fb.p.id === x.p.id;
+      if (same && x.later >= 0.5) why.push({ t: `Could wait: ${pct(x.later)} chance he's still there at #${st.after.n}`, w: 1 });
+      else if (x.fb && x.dropoff >= 15) why.push({ t: `Big drop-off after him: at #${st.after.n} you'd probably be picking from ${x.fb.p.n} and worse, about ${Math.round(x.dropoff)} points less` });
+      else if (x.fb && x.dropoff < 5) why.push({ t: `Not much drop-off: ${x.fb.p.n} should be there at #${st.after.n} and is about as good`, w: 1 });
+      else if (x.fb) why.push({ t: `At #${st.after.n} the ${pn} left would be around ${x.fb.p.n}, about ${Math.round(x.dropoff)} points less` });
+      if (x.later < 0.35) why.push({ t: `Won't last to #${st.after.n} (${pct(1 - x.later)} chance he's gone)` });
     }
-    if (!why.length) why.push({ t: `${TIER[tierOf(valOf(x.p))]} value at ${POSNAME[x.p.slot].toLowerCase()}` });
+    if (!st.onClock && st.next && x.now < 0.6) why.push({ t: `Only ${pct(x.now)} chance he's there at #${st.next.n}`, w: 1 });
     return { ...x, why, label: i === 0 ? (st.onClock ? "Take him" : "Top target") : i === 1 ? "Next best" : "Also good" };
   });
+  // long shots: better than the top card but unlikely to be there
+  const topScore = pick3.length ? pick3[0].score / (0.5 + 0.5 * pick3[0].now) : -1;
+  const longshots = st.onClock ? [] : all.filter((x) => x.now < 0.25 && x.gain - DROP_W * x.fbE > topScore).slice(0, 4);
+  return { cards, longshots };
 }
 
 /* ---------------- clock strip ---------------- */
@@ -299,6 +335,7 @@ function boardShell() {
     <div id="boardBanner"></div>
     <h3 class="sectitle" id="sugTitle">Best for you right now</h3>
     <div class="suggest" id="sug"></div>
+    <div id="longshots" hidden></div>
     <div class="controls">
       <div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
         <input id="q" type="search" placeholder="Find a player" autocomplete="off" aria-label="Find a player"><button class="clr" id="qclr" aria-label="Clear search" hidden>×</button></div>
@@ -317,13 +354,15 @@ function boardShell() {
   $("#hideTaken").onchange = (e) => { S.hideTaken = e.target.checked; LS.set("zb-hide", S.hideTaken); S.show = 60; renderBoardList(); };
   $("#more").onclick = () => { S.show += 60; renderBoardList(); };
   $("#list").addEventListener("click", onListClick);
-  $("#sug").addEventListener("click", (e) => {
+  const openFrom = (e) => {
     const b = e.target.closest("[data-open]"); if (!b) return;
     S.open = b.dataset.open; S.q = ""; $("#q").value = ""; S.pos = "ALL"; renderBoard();
     let c = document.querySelector(`.card[data-id="${CSS.escape(S.open)}"]`);
     if (!c) { S.q = player(S.open).n; $("#q").value = S.q; $("#qclr").hidden = false; renderBoardList(); c = document.querySelector(`.card[data-id="${CSS.escape(S.open)}"]`); }
     if (c) c.scrollIntoView({ behavior: "smooth", block: "center" });
-  });
+  };
+  $("#sug").addEventListener("click", openFrom);
+  $("#longshots").addEventListener("click", openFrom);
 }
 function renderBoard() {
   const st = draftState();
@@ -337,7 +376,8 @@ function renderBoard() {
   $("#boardBanner").innerHTML = ban;
   // suggestions
   const ctx = scoreAll(st, avail, lu);
-  const sg = st.done || !st.next ? [] : suggestions(st, avail, lu, ctx);
+  const sug = st.done || !st.next ? { cards: [], longshots: [] } : suggestions(st, avail, lu, ctx);
+  const sg = sug.cards;
   $("#sugTitle").hidden = !sg.length;
   $("#sugTitle").textContent = st.onClock ? "You're up. Best picks right now" : st.next ? `Best targets for your pick at #${st.next.n}` : "Best available";
   $("#sug").innerHTML = sg.map((x) => `
@@ -347,6 +387,9 @@ function renderBoard() {
       <div class="pts"><b>${fmt(ptsOf(x.p))}</b><small>proj pts</small></div>
       <div class="why">${posLine(x.p)}${x.why.map((w) => `<span class="${w.w ? "warn" : ""}">${esc(w.t)}</span>`).join("")}</div>
     </button>`).join("");
+  const ls = $("#longshots");
+  ls.hidden = !sug.longshots.length;
+  ls.innerHTML = sug.longshots.length ? `<div class="longshots"><b>If any of these fall to #${st.next.n}, take him instead:</b> ${sug.longshots.map((x) => `<button class="lsbtn" data-open="${esc(x.p.id)}">${esc(x.p.n)} <small>${pct(x.now)}</small></button>`).join("")}</div>` : "";
   // position chips with need badges
   const chips = [["ALL", "All"], ["C", "C"], ["W", "W"], ["D", "D"], ["G", "G"], ["STAR", "★"]];
   $("#posChips").innerHTML = chips.map(([k, l]) => `<button data-pos="${k}" aria-pressed="${S.pos === k}" ${k === "STAR" ? 'aria-label="Starred players"' : ""}>${l}${lu.needs[k] > 0 ? `<span class="need" title="Open starting spots">${lu.needs[k]}</span>` : ""}</button>`).join("");
@@ -406,9 +449,10 @@ function cardHTML(p, t, rank, odd, st, key, sc) {
   const tags = [];
   if (t) tags.push(`<span class="tag ${mine ? "warn" : ""}"><b>${esc(takenText(t))}</b></span>`);
   if (v != null) tags.push(`<span class="tag ${v >= 0 ? "good" : "bad"}" title="Points above the best player you could get on waivers at his position"><b>${sgn(v)}</b> value</span>`);
-  if (!t && sc && st.after && !st.done && sc.v > 0) {
+  if (!t && sc && st.after && !st.done && sc.gain > 0) {
     if (sc.later < 0.35) tags.push(`<span class="pill gold" title="Probably gone before your pick at #${st.after.n}">Take soon</span>`);
     else if (sc.later > 0.8) tags.push(`<span class="pill good" title="Likely still there at your pick #${st.after.n}">Can wait</span>`);
+    if (!sc.slot) tags.push(`<span class="pill" title="Your starting spots at his position are filled; he'd be bench depth for now">Bench</span>`);
   }
   if (p.adp != null) tags.push(`<span class="tag" title="Average draft position across Fantrax drafts">Drafted ~<b>#${fmt(p.adp)}</b></span>`);
   else if (!p.own) tags.push(`<span class="tag" title="Not in Fantrax's average draft positions">Usually <b>undrafted</b></span>`);
@@ -666,7 +710,7 @@ function renderTeam() {
   const mine = rosterOf(S.team, st);
   const lu = fillLineup(mine);
   const avail = available(st);
-  const all = META.teams.map((t) => ({ id: t.id, s: fillLineup(rosterOf(t.id, st)).strength })).sort((a, b) => b.s - a.s);
+  const all = META.teams.map((t) => ({ id: t.id, s: fillLineup(rosterOf(t.id, st)).raw })).sort((a, b) => b.s - a.s);
   const rank = all.findIndex((x) => x.id === S.team) + 1;
   const myPicks = st.picks.filter((p) => p.team === S.team);
   const left = myPicks.filter((p) => !p.pid).length;
@@ -683,7 +727,7 @@ function renderTeam() {
   el.innerHTML = `
     <div class="lede"><h2>${esc(tname(S.team))}</h2><p>Your keepers and picks, placed in the best lineup. Open spots show the best player still out there.</p></div>
     <div class="hero">
-      <div class="stat"><div class="k">Lineup strength</div><div class="v">${fmt(lu.strength)}</div><div class="s">Rank ${rank} of 12 · starters + a quarter of the bench</div></div>
+      <div class="stat"><div class="k">Lineup strength</div><div class="v">${fmt(lu.raw)}</div><div class="s">Rank ${rank} of 12 · starters + half the bench</div></div>
       <div class="stat"><div class="k">Open starting spots</div><div class="v">${openStarters}</div><div class="s">${openStarters ? Object.entries(lu.needs).filter(([, n]) => n > 0).map(([s, n]) => `${n} ${s}`).join(", ") : "Every starting spot is filled"}</div></div>
       <div class="stat"><div class="k">Picks left</div><div class="v">${left}</div><div class="s">${st.next ? (st.onClock ? "You're on the clock" : `Next: #${st.next.n}, round ${st.next.r}`) : "None left"}</div></div>
       <div class="stat"><div class="k">Roster</div><div class="v">${mine.length}<span style="font-size:16px;color:var(--ink3)"> / ${META.roster.max}</span></div><div class="s">${mine.filter((p) => st.taken[p.id].kept).length} kept · ${mine.filter((p) => !st.taken[p.id].kept).length} drafted</div></div>
@@ -733,10 +777,10 @@ function renderLeague() {
     const r = rosterOf(t.id, st); const lu = fillLineup(r);
     const picks = st.picks.filter((p) => p.team === t.id);
     return { t, r, lu, left: picks.filter((p) => !p.pid).length, first: picks.find((p) => !p.pid) };
-  }).sort((a, b) => b.lu.strength - a.lu.strength);
-  const mx = Math.max(...rows.map((x) => x.lu.strength), 1);
+  }).sort((a, b) => b.lu.raw - a.lu.raw);
+  const mx = Math.max(...rows.map((x) => x.lu.raw), 1);
   const el = $("#tab-league");
-  el.innerHTML = `<div class="lede"><h2>League</h2><p>Every team's projected lineup strength from its keepers and picks so far. Tap a team to see its roster.</p></div>
+  el.innerHTML = `<div class="lede"><h2>League</h2><p>Every team's projected points from its keepers and picks so far (starters plus half the bench). Tap a team to see its roster.</p></div>
   <div class="teams">${rows.map((x, i) => {
     const open = !!S.leagueOpen[x.t.id];
     const lines = [];
@@ -745,8 +789,8 @@ function renderLeague() {
     return `<div class="tcard ${x.t.id === S.team ? "me" : ""}">
       <button class="th" data-team="${x.t.id}" aria-expanded="${open}"><div class="rk">${i + 1}</div>
         <div><div class="tn">${esc(x.t.name)}</div><div class="ts">${x.r.length} players · ${x.left} picks left${x.first ? ` · next #${x.first.n}` : ""}</div></div>
-        <div class="tp"><b>${fmt(x.lu.strength)}</b><small>strength</small></div></button>
-      <div class="meter"><i style="width:${(100 * x.lu.strength) / mx}%"></i></div>
+        <div class="tp"><b>${fmt(x.lu.raw)}</b><small>strength</small></div></button>
+      <div class="meter"><i style="width:${(100 * x.lu.raw) / mx}%"></i></div>
       ${open ? `<div class="body">${lines.map(([s, p, pts]) => `<div class="mini"><span class="pos">${s}</span><span>${esc(p.n)} <span class="note">${esc(p.t)} · ${keptOr(st.taken[p.id])}</span></span><b>${fmt(pts)}</b></div>`).join("")}</div>` : ""}
     </div>`;
   }).join("")}</div>`;
@@ -802,7 +846,14 @@ function renderHow() {
 
   <h3>Our stats vs. where drafters take players</h3>
   <p>Our projections only know past stats. Drafters know things stats don't, like a new backup taking starts, a team that got worse, or a player moving up to the top line. So every player's number is a blend. Our stats set how much each position is worth in <i>this</i> league's scoring. Where Fantrax drafters take him sets how good he is compared with other players at his position. Skaters are ${Math.round(META.wModel.C * 100)}% our stats and ${Math.round((1 - META.wModel.C) * 100)}% drafters. Goalies are ${Math.round(META.wModel.G * 100)}% ours, because goalie projections are the least reliable. Those splits come from testing against past seasons (see below).</p>
-  <p>The draft board starts in <b>Best pick for you now</b> order. That's value, adjusted for whether a player fills an open starting spot and whether he's likely to last until your next turn. <span class="pill gold">Take soon</span> means he'll probably be gone before your following pick. <span class="pill good">Can wait</span> means he'll probably still be there, so you can grab someone else first. Switch to <b>Most value</b> to see the pure ranking.</p>
+  <h3>How "Best pick for you now" is decided</h3>
+  <p>For every available player it asks two questions:</p>
+  <ul>
+    <li><b>How much better does your lineup get if you add him?</b> He's dropped into your roster, everyone is re-slotted (a center/wing player can move over to make room), and the gain is measured in points over waiver level. A player who'd only be bench depth counts at half, since with daily lineups a bench player only plays when a starter at his spot has the night off.</li>
+    <li><b>What would you get at that position if you wait until your next pick?</b> Using where drafters usually take players, it works out who's likely to still be there next time and what they're worth. Half of that expected fallback is subtracted. So a player at a deep position (lots of similar guys behind him) scores lower than one at a thin position, and a player you can probably get later scores lower than one you can't.</li>
+  </ul>
+  <p>Before your pick, the cards also weigh in the chance he's still there when you're up, and the strip below them lists better players who'd be worth taking instead if they happen to fall. When you're on the clock, it's just the two questions above. <span class="pill gold">Take soon</span> means he'll probably be gone before your following pick. <span class="pill good">Can wait</span> means he'll probably still be there. Switch to <b>Most value</b> to see the pure ranking.</p>
+  <p class="note">Close calls are close: when the top three are within a few points of each other, the method is telling you it's a coin flip, and things it can't see (a line change, a new coach, your gut) should decide it.</p>
 
   <h3>“Left at your pick”</h3>
   <p>The chance a player is still there at your next pick. It uses his Fantrax ADP (average draft position across Fantrax leagues) compared with the other players still available, and how many picks happen before yours. Treat it as a guide. Your leaguemates don't all draft by ADP.</p>
