@@ -260,10 +260,46 @@ footer{max-width:1180px;margin:0 auto;padding:0 16px 40px;font-size:12.5px;color
 .toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);background:var(--panel3);color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:10px 14px;box-shadow:var(--shadow);display:flex;gap:12px;align-items:center;z-index:50;max-width:calc(100vw - 32px);font-size:14px}
 .toast button{border:0;background:none;color:var(--ice);font-weight:700;cursor:pointer}
 
+
+/* ---------- draft bar + pick sheet ---------- */
+.draftbar{position:fixed;left:0;right:0;bottom:0;z-index:40;background:color-mix(in srgb,var(--panel) 97%,transparent);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border-top:1px solid var(--line);box-shadow:0 -8px 24px rgba(0,0,0,.28);padding:9px 12px;padding-bottom:calc(9px + env(safe-area-inset-bottom));display:flex;align-items:center;gap:9px}
+.draftbar .who{min-width:0;flex:1}
+.draftbar .who b{display:block;font-family:var(--font-d);font-size:15px;letter-spacing:.04em;text-transform:uppercase;line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.draftbar .who span{display:block;font-size:12.5px;color:var(--ink2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.draftbar.mineturn{background:linear-gradient(90deg,color-mix(in srgb,var(--gold) 22%,var(--panel)),var(--panel))}
+.draftbar.mineturn .who b{color:var(--gold)}
+.bigbtn{background:var(--ice);color:var(--ice-ink);border:0;border-radius:12px;padding:12px 16px;font-weight:700;font-size:15px;cursor:pointer;white-space:nowrap;min-height:44px}
+.smallbtn{border:1px solid var(--line);background:var(--panel2);color:var(--ink2);border-radius:12px;padding:10px 12px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;min-height:44px}
+body.hasbar main{padding-bottom:96px}
+body.hasbar .toast{bottom:88px}
+
+.sheet{position:fixed;inset:0;z-index:60;background:var(--bg);display:flex;flex-direction:column}
+.sheet .sh{padding:10px 12px;border-bottom:1px solid var(--line);display:flex;gap:10px;align-items:center;background:var(--panel)}
+.sheet .sh .t{flex:1;min-width:0}
+.sheet .sh .t b{display:block;font-family:var(--font-d);font-size:17px;letter-spacing:.04em;text-transform:uppercase;line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sheet .sh .t span{display:block;font-size:13px;color:var(--ink2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sheet .sh .x{width:44px;height:44px;border-radius:999px;border:1px solid var(--line);background:var(--panel2);color:var(--ink);font-size:20px;cursor:pointer;flex:0 0 auto}
+.sheet .sq{padding:10px 12px;background:var(--panel);border-bottom:1px solid var(--line);display:flex;gap:8px}
+.sheet .sq input{flex:1;min-width:0;background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:12px 14px;font-size:16px}
+.sheet .list{display:block;flex:1 1 auto;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:8px 10px;padding-bottom:calc(20px + env(safe-area-inset-bottom))}
+.sheet .hint{font-size:12.5px;color:var(--ink3);padding:2px 4px 8px}
+.srow{flex:none;display:grid;grid-template-columns:38px minmax(0,1fr) auto;gap:10px;align-items:center;width:100%;text-align:left;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:9px 12px;margin-bottom:7px;cursor:pointer;position:relative;overflow:hidden}
+.srow::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--tc,var(--t5))}
+.srow .face{width:38px;height:38px}
+.srow .nm{font-weight:700;font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.srow .mt{font-size:12.5px;color:var(--ink2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.srow .p{font-family:var(--font-d);font-size:20px;text-align:right}
+.srow .p small{display:block;font-family:var(--font-b);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink3)}
+.qmark{border:1px solid var(--line);background:var(--panel2);color:var(--ink2);border-radius:9px;padding:4px 9px;font-size:12.5px;font-weight:700;cursor:pointer;display:inline-flex;align-items:center;gap:5px;min-height:30px}
+.qmark svg{width:13px;height:13px}
+.cellbtn{width:100%;text-align:left;font:inherit;color:inherit;cursor:pointer}
+.cell.empty{border-style:dashed}
+
 @media (max-width:720px){
   .suggest{grid-template-columns:none;grid-auto-flow:column;grid-auto-columns:86%;overflow-x:auto;scroll-snap-type:x mandatory;padding-bottom:4px;scrollbar-width:none;margin-right:-16px;padding-right:16px}
   .suggest::-webkit-scrollbar{display:none}
   .sug{scroll-snap-align:start}
+  .draftbar .who b{font-size:14px}
   .bar{flex-wrap:wrap}
   .logo{flex:1 1 100%}
   .logo h1{font-size:20px}
@@ -311,7 +347,7 @@ footer{max-width:1180px;margin:0 auto;padding:0 16px 40px;font-size:12.5px;color
 <footer id="foot"></footer>
 <div class="toast" id="toast" hidden><span id="toastMsg"></span><button id="toastBtn">Undo</button></div>
 
-<script src="data/board.js?v=20260917c"></script>
-<script src="app.js?v=20260917c"></script>
+<script src="data/board.js?v=20260920a"></script>
+<script src="app.js?v=20260920a"></script>
 </body>
 </html>

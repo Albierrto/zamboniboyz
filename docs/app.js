@@ -36,6 +36,7 @@ const S = {
   leagueOpen: {},
   live: { picks: null, owners: null, at: null, err: null, rosAt: 0, fails: 0 },
   lastSig: "", wasOnClock: false, seenPicks: null,
+  sheet: null, sheetQ: "", lastMark: null,
 };
 
 /* ---------------- dates ---------------- */
@@ -418,6 +419,7 @@ function cardHTML(p, t, rank, odd, st, key, sc) {
   if (p.rk) tags.push(`<span class="pill gold">Rookie</span>`);
   if (p.nt) tags.push(`<span class="pill bad">No NHL contract</span>`);
   if (p.slot === "G" && S.gsOv[p.id] != null) tags.push(`<span class="pill gold">Your starts: ${S.gsOv[p.id]}</span>`);
+  if (!t && !st.done) tags.push(`<button class="qmark" data-qmark="${esc(p.id)}" title="Mark him taken at pick #${st.cur ? st.cur.n : ""}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="m4 12 6 6L20 6"/></svg>Taken</button>`);
   const star = !!S.stars[p.id];
   tags.push(`<button class="star" data-star="${esc(p.id)}" aria-pressed="${star}" aria-label="${star ? "Remove from" : "Add to"} short list"><svg viewBox="0 0 24 24" fill="${star ? "currentColor" : "none"}" stroke="currentColor" stroke-width="1.8"><path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9z"/></svg></button>`);
   const shownPts = key === "ALL" ? ptsOf(p) : ptsAt(p, key);
@@ -488,13 +490,13 @@ function detailHTML(p, t, st) {
   return `<div class="detail">${parts.join("")}</div>`;
 }
 function onListClick(e) {
-  const tg = e.target.closest("[data-toggle],[data-star],[data-mark],[data-unmark],[data-gs],[data-gsreset]");
+  const tg = e.target.closest("[data-toggle],[data-star],[data-mark],[data-unmark],[data-gs],[data-gsreset],[data-qmark]");
   if (!tg) return;
   const d = tg.dataset;
   if (d.toggle) { S.open = S.open === d.toggle ? null : d.toggle; rerenderCard(d.toggle); return; }
   if (d.star) { if (S.stars[d.star]) delete S.stars[d.star]; else S.stars[d.star] = 1; LS.set("zb-stars", S.stars); rerenderCard(d.star); return; }
-  if (d.mark) { markTaken(d.mark); return; }
-  if (d.unmark) { delete S.manual[d.unmark]; LS.set("zb-manual", S.manual); renderAll(); return; }
+  if (d.mark || d.qmark) { markTaken(d.mark || d.qmark); S.lastSig = ""; renderAll(); renderBar(); return; }
+  if (d.unmark) { unmark(d.unmark); return; }
   if (d.gs) {
     const p = PL.get(d.gs); const cur = gsOf(p);
     S.gsOv[d.gs] = Math.max(0, Math.min(82, Math.round((cur + Number(d.d)) / 5) * 5)); LS.set("zb-gs", S.gsOv); renderAll(); return;
@@ -516,17 +518,149 @@ function rerenderCard(id) {
     c.replaceWith(tmp.firstElementChild);
   });
 }
-function markTaken(id) {
+function markTaken(id, pickNo) {
   const st = draftState();
-  if (!st.cur) return;
-  S.manual[id] = st.cur.n; LS.set("zb-manual", S.manual);
+  const n = pickNo != null ? pickNo : st.cur && st.cur.n;
+  if (n == null) return;
+  const pk = st.picks.find((p) => p.n === n);
+  S.manual[id] = n; LS.set("zb-manual", S.manual);
+  S.lastMark = id;
   const p = player(id);
   if (S.open === id) S.open = null;
-  toast(`${p.n} marked as taken by ${tname(st.cur.team)}`, () => { delete S.manual[id]; LS.set("zb-manual", S.manual); renderAll(); });
-  renderAll();
+  toast(`#${n} ${pk ? tname(pk.team) : "taken"}: ${p.n}`, () => unmark(id));
+  return n;
+}
+function unmark(id) {
+  delete S.manual[id]; LS.set("zb-manual", S.manual);
+  if (S.lastMark === id) S.lastMark = null;
+  S.lastSig = ""; renderAll(); renderBar();
 }
 
-/* ---------------- my team ---------------- */
+/* ---------------- manual pick entry ---------------- */
+function openSheet(n) {
+  const st = draftState();
+  S.sheet = n != null ? n : st.cur && st.cur.n;
+  if (S.sheet == null) return;
+  S.sheetQ = "";
+  renderSheet();
+  setTimeout(() => { const i = $("#sheetQ"); if (i) i.focus(); }, 60);
+}
+function closeSheet() {
+  S.sheet = null; S.sheetQ = "";
+  const el = $("#sheet"); if (el) el.remove();
+  document.body.style.overflow = "";
+  S.lastSig = ""; renderAll(); renderBar();
+}
+function sheetRows(st, n) {
+  const avail = available(st);
+  const q = fold(S.sheetQ).trim();
+  let rows;
+  if (q) {
+    rows = avail.filter((p) => fold(p.n).includes(q) || fold(p.t) === q);
+    rows.sort((a, b) => {
+      const sa = fold(a.n).startsWith(q) || fold(a.n).split(" ").slice(-1)[0].startsWith(q) ? 0 : 1;
+      const sb = fold(b.n).startsWith(q) || fold(b.n).split(" ").slice(-1)[0].startsWith(q) ? 0 : 1;
+      return sa - sb || (valOf(b) ?? -999) - (valOf(a) ?? -999);
+    });
+  } else {
+    const lu = fillLineup(rosterOf(S.team, st));
+    const ctx = scoreAll(st, avail, lu);
+    rows = ctx.scored.map((x) => x.p);
+    const seen = new Set(rows.map((p) => p.id));
+    avail.forEach((p) => { if (!seen.has(p.id)) rows.push(p); });
+  }
+  return rows.slice(0, 60);
+}
+function renderSheet() {
+  const st = draftState();
+  const n = S.sheet;
+  if (n == null) return;
+  const pk = st.picks.find((p) => p.n === n);
+  const filled = pk && pk.pid ? player(pk.pid) : null;
+  const rows = sheetRows(st, n);
+  let el = $("#sheet");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "sheet"; el.className = "sheet";
+    document.body.appendChild(el);
+    document.body.style.overflow = "hidden";
+  }
+  const mine = pk && pk.team === S.team;
+  el.innerHTML = `
+    <div class="sh">
+      <div class="t"><b>${pk ? `Pick #${pk.n} · Round ${pk.r}` : `Pick #${n}`}</b><span>${pk ? esc(tname(pk.team)) : ""}${mine ? " · your pick" : ""}</span></div>
+      ${S.lastMark ? `<button class="smallbtn" id="sheetUndo">Undo last</button>` : ""}
+      <button class="x" id="sheetX" aria-label="Close">×</button>
+    </div>
+    <div class="sq"><input id="sheetQ" type="search" inputmode="search" autocomplete="off" placeholder="Type a name, or tap from the list" value="${esc(S.sheetQ)}"></div>
+    <div class="list" id="sheetList">
+      ${filled ? `<div class="hint">Pick #${n} already has <b>${esc(filled.n)}</b>${pk.manual ? ` · <button class="qmark" data-undo="${esc(filled.id)}">Undo</button>` : " (from Fantrax)"}. Tapping a player below replaces it.</div>` : `<div class="hint">Tap whoever was just taken. The next pick opens automatically, so you can keep tapping as the draft goes.</div>`}
+      ${rows.map((p) => `<button class="srow" data-take="${esc(p.id)}" style="--tc:var(--t${tierOf(valOf(p))})">
+        ${face(p)}
+        <div><div class="nm">${esc(p.n)}</div><div class="mt">${esc((p.pos || p.slot).replace(/,/g, "/"))} · ${esc(p.t || "No team")}${p.adp != null ? ` · usually #${fmt(p.adp)}` : ""}</div></div>
+        <div class="p">${fmt(ptsOf(p))}<small>pts</small></div>
+      </button>`).join("") || `<div class="empty">No player matches that.</div>`}
+    </div>`;
+  $("#sheetX").onclick = closeSheet;
+  if ($("#sheetUndo")) $("#sheetUndo").onclick = () => { unmark(S.lastMark); renderSheet(); };
+  const inp = $("#sheetQ");
+  inp.oninput = (e) => { S.sheetQ = e.target.value; if (S.sheet != null) renderSheetList(); };
+  inp.onkeydown = (e) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    const first = $("#sheetList .srow");
+    if (first) first.click();
+  };
+  el.querySelector("#sheetList").addEventListener("click", onSheetClick);
+}
+function renderSheetList() {
+  const st = draftState();
+  const rows = sheetRows(st, S.sheet);
+  const list = $("#sheetList");
+  if (!list) return;
+  list.innerHTML = rows.map((p) => `<button class="srow" data-take="${esc(p.id)}" style="--tc:var(--t${tierOf(valOf(p))})">
+      ${face(p)}
+      <div><div class="nm">${esc(p.n)}</div><div class="mt">${esc((p.pos || p.slot).replace(/,/g, "/"))} · ${esc(p.t || "No team")}${p.adp != null ? ` · usually #${fmt(p.adp)}` : ""}</div></div>
+      <div class="p">${fmt(ptsOf(p))}<small>pts</small></div>
+    </button>`).join("") || `<div class="empty">No one matches that. Deep prospects aren't on this board, and Fantrax will fill that pick in on its own.</div>`;
+}
+function onSheetClick(e) {
+  const b = e.target.closest("[data-take],[data-undo]");
+  if (!b) return;
+  if (b.dataset.undo) { unmark(b.dataset.undo); renderSheet(); return; }
+  const was = S.sheet;
+  markTaken(b.dataset.take, was);
+  const st = draftState();
+  const next = st.picks.find((p) => !p.pid && p.n > was) || st.picks.find((p) => !p.pid);
+  S.sheetQ = "";
+  if (next) { S.sheet = next.n; renderSheet(); setTimeout(() => { const i = $("#sheetQ"); if (i) i.focus(); }, 30); }
+  else closeSheet();
+  S.lastSig = "";
+  renderBar();
+}
+
+/* ---------------- sticky draft bar ---------------- */
+function renderBar() {
+  const st = draftState();
+  let bar = $("#draftbar");
+  if (st.done) { if (bar) bar.remove(); document.body.classList.remove("hasbar"); return; }
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "draftbar"; bar.className = "draftbar";
+    document.body.appendChild(bar);
+  }
+  document.body.classList.add("hasbar");
+  const cur = st.cur;
+  bar.className = "draftbar" + (st.onClock ? " mineturn" : "");
+  bar.innerHTML = `
+    <div class="who"><b>${st.onClock ? "Your pick" : `Pick #${cur.n} · Round ${cur.r}`}</b><span>${esc(tname(cur.team))}${st.onClock ? "" : st.next ? ` · you're at #${st.next.n}` : ""}</span></div>
+    ${S.lastMark ? `<button class="smallbtn" id="barUndo">Undo</button>` : ""}
+    <button class="bigbtn" id="barGo">Enter pick</button>`;
+  $("#barGo").onclick = () => openSheet(null);
+  if ($("#barUndo")) $("#barUndo").onclick = () => unmark(S.lastMark);
+}
+
+/* ---------------- my team ---------------- *//* ---------------- my team ---------------- */
 function renderTeam() {
   const st = draftState();
   const mine = rosterOf(S.team, st);
@@ -581,10 +715,15 @@ function renderGrid() {
       const cls = ["cell", p.team === S.team ? "me" : "", st.cur && st.cur.n === p.n ? "now" : ""].join(" ");
       const T = TEAMS[p.team];
       const tm = T ? (T.name.length > 16 && T.short ? T.short : T.name) : "?";
-      return `<div class="${cls}"><div class="h"><span>#${p.n}</span><span>${esc(tm)}</span></div>
-        ${pl ? `<div class="pl"><span class="tb" style="--tc:var(--t${tierOf(valOf(pl))})"></span>${esc(pl.n)}</div><div class="pp">${esc((pl.pos || "").replace(/,/g, "/"))} · ${esc(pl.t)} · ${fmt(ptsOf(pl))} pts${p.manual ? " · marked by hand" : ""}</div>`
-          : `<div class="pl none">${st.cur && st.cur.n === p.n ? "On the clock" : "—"}</div><div class="pp">&nbsp;</div>`}</div>`;
+      const editable = !p.pid || p.manual;
+      const inner = `<div class="h"><span>#${p.n}</span><span>${esc(tm)}</span></div>
+        ${pl ? `<div class="pl"><span class="tb" style="--tc:var(--t${tierOf(valOf(pl))})"></span>${esc(pl.n)}</div><div class="pp">${esc((pl.pos || "").replace(/,/g, "/"))} · ${esc(pl.t)} · ${fmt(ptsOf(pl))} pts${p.manual ? " · by hand, tap to change" : ""}</div>`
+          : `<div class="pl none">${st.cur && st.cur.n === p.n ? "On the clock" : "Tap to enter"}</div><div class="pp">&nbsp;</div>`}`;
+      return editable
+        ? `<button class="${cls} cellbtn ${pl ? "" : "empty"}" data-pick="${p.n}">${inner}</button>`
+        : `<div class="${cls}">${inner}</div>`;
     }).join("")}</div></div>`).join("");
+  el.querySelectorAll("[data-pick]").forEach((b) => (b.onclick = () => openSheet(Number(b.dataset.pick))));
 }
 
 /* ---------------- league ---------------- */
@@ -716,6 +855,7 @@ function renderAll() {
   const st = draftState();
   renderClock(st);
   renderTab();
+  renderBar();
 }
 let toastTimer = null;
 function toast(msg, undo) {
@@ -796,6 +936,8 @@ function afterSync() {
     try { if (navigator.vibrate && navigator.userActivation && navigator.userActivation.hasBeenActive) navigator.vibrate([200, 100, 200]); } catch (e) {}
   }
   S.wasOnClock = st.onClock;
+  renderBar();
+  if (S.sheet != null && document.activeElement !== $("#sheetQ")) renderSheet();
   const sig = signature(st);
   if (sig !== S.lastSig) {
     S.lastSig = sig;
@@ -817,6 +959,7 @@ function schedule(st) {
   if (S.live.fails) ms = Math.min(60000, 8000 * 2 ** Math.min(S.live.fails, 3));
   timer = setTimeout(() => sync(false), ms);
 }
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && S.sheet != null) closeSheet(); });
 document.addEventListener("visibilitychange", () => { if (!document.hidden) sync(false); else clearTimeout(timer); });
 setInterval(() => renderClock(draftState()), 5000);
 
@@ -848,6 +991,7 @@ function init() {
   if (["board", "team", "grid", "league", "how"].includes(hash)) S.tab = hash;
   setTab(S.tab);
   renderClock(draftState());
+  renderBar();
   sync(true);
 }
 init();
