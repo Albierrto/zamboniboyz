@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>ZamboniBoyz Draft Room</title>
-<meta name="description" content="Draft board for the ZamboniBoyz Fantrax hockey league: projections built for this league's scoring, live pick tracking, and who to take next.">
+<title>ZamboniBoyz Hockey</title>
+<meta name="description" content="ZamboniBoyz Fantrax hockey: projections built for this league's scoring and blended with analysts, your weekly matchup night by night, and the best pickups.">
 <meta name="theme-color" content="#0A1220">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230A1220'/%3E%3Cellipse cx='16' cy='20' rx='10' ry='4.5' fill='%235EC8F2'/%3E%3Cpath d='M6 20v-3c0-2.5 4.5-4.5 10-4.5s10 2 10 4.5v3' fill='%23EEF3FA'/%3E%3Cellipse cx='16' cy='17' rx='10' ry='4.5' fill='%23EEF3FA'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -258,6 +258,7 @@ td.hl{color:var(--ice);font-weight:700}
 .prose p,.prose li{color:var(--ink2);font-size:15px}
 .prose b{color:var(--ink)}
 .prose .tablewrap{margin:10px 0}
+.prose td:first-child{white-space:normal}
 
 footer{max-width:1180px;margin:0 auto;padding:0 16px 40px;font-size:12.5px;color:var(--ink3)}
 
@@ -300,6 +301,45 @@ body.hasbar .toast{bottom:88px}
 .cellbtn{width:100%;text-align:left;font:inherit;color:inherit;cursor:pointer}
 .cell.empty{border-style:dashed}
 
+
+/* ---------- in-season ---------- */
+.matchup{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:12px 14px;margin:0 0 14px;display:grid;gap:8px}
+.matchup .mh{display:flex;justify-content:space-between;gap:10px;font-family:var(--font-d);font-size:13px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink3)}
+.matchup .side{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:3px 10px;align-items:end}
+.matchup .side .tn{font-weight:700;font-size:15.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.matchup .side .tn small{font-weight:500;font-size:12.5px;color:var(--ink3);margin-left:8px}
+.matchup .side .mbar{grid-column:1/-1;height:9px;border-radius:9px;background:var(--panel3);overflow:hidden}
+.matchup .side .mbar i{display:block;height:100%;background:var(--ink3);border-radius:9px}
+.matchup .side.me .mbar i{background:var(--ice)}
+.matchup .side b{font-family:var(--font-d);font-size:24px;font-weight:600;text-align:right;line-height:1}
+.matchup .mf{font-size:13.5px;color:var(--ink2);border-top:1px solid var(--line);padding-top:8px}
+.matchup .mf b{color:var(--ink)}
+.alerts .banner{margin-bottom:8px}
+.alerts{margin-bottom:14px}
+.linkbtn{border:0;background:none;color:var(--ice);font-weight:700;cursor:pointer;padding:0;font-size:inherit;text-decoration:underline}
+.days{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:8px;margin:0 0 18px}
+.day{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:9px 11px;display:grid;grid-template-columns:48px minmax(0,1fr);gap:10px;align-items:start}
+.day.today{border-color:var(--ice);box-shadow:0 0 0 1px var(--ice) inset}
+.day .dd{display:flex;flex-direction:column;line-height:1.15}
+.day .dd b{font-family:var(--font-d);font-size:17px;letter-spacing:.04em;text-transform:uppercase}
+.day .dd span{font-size:12px;color:var(--ink3)}
+.day .di{font-size:13.5px;color:var(--ink2);min-width:0}
+.day .di b{color:var(--ink)}
+.day .sit{color:var(--gold);font-size:12.5px}
+.day .gap{color:var(--ink3);font-size:12.5px}
+button.slot{width:100%;background:none;border:0;border-top:1px solid var(--line);text-align:left;cursor:pointer;font:inherit;color:inherit}
+.slotgrp h3 + button.slot{border-top:0}
+.slot .nm .pill{vertical-align:1px;margin-left:4px}
+.gainv{color:var(--good)}
+.mups{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px;margin:0 0 18px}
+.mup{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:8px 12px;display:grid;gap:4px}
+.mup.me{border-color:color-mix(in srgb,var(--gold) 60%,var(--line))}
+.mup>div{display:flex;justify-content:space-between;gap:10px;font-size:14px;color:var(--ink2)}
+.mup>div span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mup>div.fav{color:var(--ink);font-weight:700}
+.mup b{font-family:var(--font-m);font-weight:500}
+@media (max-width:720px){ #tab-team .hero{grid-template-columns:repeat(3,minmax(0,1fr));gap:8px} #tab-team .hero .stat{padding:10px} #tab-team .hero .v{font-size:24px} #tab-team .hero .s{font-size:12px} .days{grid-template-columns:1fr 1fr} .day{grid-template-columns:1fr;gap:4px} .day .dd{flex-direction:row;gap:6px;align-items:baseline} }
+
 @media (max-width:720px){
   .suggest{grid-template-columns:none;grid-auto-flow:column;grid-auto-columns:86%;overflow-x:auto;scroll-snap-type:x mandatory;padding-bottom:4px;scrollbar-width:none;margin-right:-16px;padding-right:16px}
   .suggest::-webkit-scrollbar{display:none}
@@ -327,15 +367,15 @@ body.hasbar .toast{bottom:88px}
   <div class="bar">
     <div class="logo">
       <svg viewBox="0 0 40 40" aria-hidden="true"><rect width="40" height="40" rx="10" fill="var(--panel3)"/><path d="M9 25v-4c0-3.3 5-6 11-6s11 2.7 11 6v4c0 3.3-5 6-11 6s-11-2.7-11-6z" fill="var(--ink)"/><ellipse cx="20" cy="21" rx="11" ry="6" fill="var(--ink2)"/><ellipse cx="20" cy="21" rx="11" ry="6" fill="none" stroke="var(--ink)" stroke-width="1.2"/><path d="M6 12h9M4 16h8M8 8h9" stroke="var(--ice)" stroke-width="2.2" stroke-linecap="round"/></svg>
-      <h1>ZamboniBoyz <span>Draft Room</span><small class="sub" id="subline">2026-27 season</small></h1>
+      <h1>ZamboniBoyz <span>Hockey</span><small class="sub" id="subline">2026-27 season</small></h1>
     </div>
-    <div class="teampick"><label for="teamSel">Drafting as</label><select id="teamSel" aria-label="Which team you are drafting for"></select></div>
+    <div class="teampick"><label for="teamSel">Team</label><select id="teamSel" aria-label="Which team is yours"></select></div>
     <button class="iconbtn" id="themeBtn" aria-label="Switch light or dark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M4.9 19.1l1.8-1.8M17.3 6.7l1.8-1.8"/></svg></button>
   </div>
   <nav class="tabs" role="tablist">
-    <button role="tab" data-tab="board" aria-selected="true">Draft board</button>
-    <button role="tab" data-tab="team">My team</button>
-    <button role="tab" data-tab="grid">Pick by pick</button>
+    <button role="tab" data-tab="team" aria-selected="true">My team</button>
+    <button role="tab" data-tab="adds">Pickups</button>
+    <button role="tab" data-tab="board">Players</button>
     <button role="tab" data-tab="league">League</button>
     <button role="tab" data-tab="how">How it works</button>
   </nav>
@@ -343,16 +383,16 @@ body.hasbar .toast{bottom:88px}
 </header>
 
 <main>
-  <section id="tab-board"></section>
-  <section id="tab-team" hidden></section>
-  <section id="tab-grid" hidden></section>
+  <section id="tab-team"></section>
+  <section id="tab-adds" hidden></section>
+  <section id="tab-board" hidden></section>
   <section id="tab-league" hidden></section>
   <section id="tab-how" hidden></section>
 </main>
 <footer id="foot"></footer>
 <div class="toast" id="toast" hidden><span id="toastMsg"></span><button id="toastBtn">Undo</button></div>
 
-<script src="data/board.js?v=20260920c"></script>
-<script src="app.js?v=20260920c"></script>
+<script src="data/board.js?v=20260924a"></script>
+<script src="app.js?v=20260924a"></script>
 </body>
 </html>
