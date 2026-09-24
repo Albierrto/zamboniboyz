@@ -7,6 +7,8 @@ T = 2027
 ps = pd.read_pickle("data/final_skaters.pkl"); pg = pd.read_pickle("data/final_goalies.pkl"); rook = pd.read_pickle("data/rookies.pkl")
 sk = pd.read_pickle("data/skater_seasons.pkl"); gl = pd.read_pickle("data/goalie_seasons.pkl")
 league = json.load(open("data/raw/getLeagueInfo.json"))
+import experts as EX, news as NEWS
+from expertlab import norm as enorm
 rosters = json.load(open("data/raw/getTeamRosters.json"))
 draft = json.load(open("data/raw/getDraftResults.json"))
 standings = json.load(open("data/raw/getStandings.json"))
@@ -28,13 +30,57 @@ R["slots"] = [s if k == "S" else ["G"] for s, k in zip(R.slots, R.kind)]
 R["best_slot"] = [s[0] if len(s) else "W" for s in R.slots]
 allp = pd.concat([S, G, R], ignore_index=True)
 allp = allp[allp.proj_pts.notna()].copy()
+allp["nm"] = [n if isinstance(n, str) else f for n, f in zip(allp["name"], allp.fname)]
+
+# ---- 2026-27 schedule: 84 games, but the fantasy season ends with the last scoring period ----
+SCHED = json.load(open("data/raw/sched/2027.json"))
+PERIODS = league["scoringPeriods"]
+def _ts(x):  # Fantrax "2026-10-05T18:59:59.0-0400" -> aware datetime
+    return datetime.datetime.strptime(x.replace(".0", ""), "%Y-%m-%dT%H:%M:%S%z")
+P_START, P_END = _ts(PERIODS[0]["startDate"]), _ts(PERIODS[-1]["endDate"])
+def _gts(g): return datetime.datetime.fromisoformat(g["utc"].replace("Z", "+00:00"))
+FGAMES = [g for g in SCHED if P_START <= _gts(g) <= P_END]
+TG = {}
+for g in FGAMES:
+    for t in (g["home"], g["away"]): TG[t] = TG.get(t, 0) + 1
+TG_AVG = float(np.mean(list(TG.values())))
+print("fantasy-window games per team:", min(TG.values()), "-", max(TG.values()))
+def missed(team, ret):
+    if not isinstance(ret, str) or not isinstance(team, str) or not team: return 0
+    return sum(1 for g in FGAMES if g["date"] < ret and team in (g["home"], g["away"]))
+allp["tg"] = allp.team.map(lambda t: TG.get(t, TG_AVG) if isinstance(t, str) and t else TG_AVG)
+allp["inj_ret"] = allp.nm.map(lambda n: NEWS.INJ.get(n, (None, None))[0])
+allp["inj_note"] = allp.nm.map(lambda n: NEWS.INJ.get(n, (None, None))[1])
+allp["miss"] = [missed(t, r) for t, r in zip(allp.team, allp.inj_ret)]
+print("injured players matched:", int(allp.inj_ret.notna().sum()), "of", len(NEWS.INJ),
+      "| missing:", sorted(set(NEWS.INJ) - set(allp.nm)))
+# model numbers are on an 82-game scale: rescale to this team's fantasy games, minus known absences
+fac = (allp.tg - allp.miss) / 82.0
+lost_gs = np.where(allp.kind.eq("G"), allp.proj_gs.fillna(0) * allp.miss / 82.0, 0)
+for c in ["proj_pts", "proj_gp", "proj_gs"]:
+    allp[c] = allp[c] * fac
+# a hurt or absent goalie's starts go to his healthy teammates
+allp["gs_extra"] = 0.0
+for i in allp.index[(lost_gs > 0.5)]:
+    t = allp.at[i, "team"]
+    mates = allp[(allp.kind == "G") & (allp.team == t) & (allp.index != i) & (allp.miss == 0) & allp.proj_gs.notna()]
+    if not len(mates) or not t: continue
+    share = mates.proj_gs / mates.proj_gs.sum()
+    for j, sh in share.items():
+        allp.at[j, "gs_extra"] += lost_gs[allp.index.get_loc(i)] * sh
+g_m = allp.kind.eq("G") & (allp.gs_extra > 0) & (allp.proj_gs > 0)
+per_start = allp.proj_pts / allp.proj_gs
+allp.loc[g_m, "proj_pts"] = allp.loc[g_m, "proj_pts"] + allp.loc[g_m, "gs_extra"] * per_start[g_m]
+allp.loc[g_m, "proj_gp"] = allp.loc[g_m, "proj_gp"] + allp.loc[g_m, "gs_extra"] / allp.loc[g_m, "gs_per_gp"]
+allp.loc[g_m, "proj_gs"] = allp.loc[g_m, "proj_gs"] + allp.loc[g_m, "gs_extra"]
+print("goalie starts moved to teammates:", allp.loc[g_m, ["nm", "team", "gs_extra"]].round(1).values.tolist())
 
 # points at each slot for the season (skaters): scale per-slot ppg by the same blend factor
 for s in ["C", "W", "D"]:
     col = "pts_" + s
     allp[col] = np.nan
     m = allp.kind.eq("S") & allp["ppg_" + s].notna()
-    ratio = allp.loc[m, "proj_pts"] / (allp.loc[m, "ppg"] * allp.loc[m, "proj_gp"])
+    ratio = (allp.loc[m, "proj_pts"] / (allp.loc[m, "ppg"] * allp.loc[m, "proj_gp"])).replace([np.inf, -np.inf], np.nan).fillna(1.0)
     allp.loc[m, col] = allp.loc[m, "ppg_" + s] * allp.loc[m, "proj_gp"] * ratio
 allp["pts_G"] = np.where(allp.kind.eq("G"), allp.proj_pts, np.nan)
 # rookies have no per-slot rates: same number at every eligible slot
@@ -76,36 +122,41 @@ print("goalie calibration: actual = %.1f + %.2f x projected" % (CAL["a"], CAL["b
 allp["pts_model_raw"] = np.where(allp.kind.eq("G"), allp.pts_G, np.nan)
 allp["pts_G"] = np.where(allp.kind.eq("G"), CAL["a"] + CAL["b"] * allp.pts_G, np.nan)
 
-# 2) blend with the market. Within each position, a player's market rank (Fantrax ADP) is turned into
-#    points using this league's own scoring: the market's k-th goalie gets our k-th goalie's points.
-#    Our model decides how much a position is worth here; the market helps decide who is good
-#    (it knows depth charts, injuries and team changes that the stats don't).
-ADP_FLOOR = 285   # Fantrax gives never-drafted players an ADP of ~290; treat 285+ as undrafted
-W_MODEL = {"C": 0.8, "W": 0.8, "D": 0.8, "G": 0.6}   # tested against 3 seasons of preseason expert rankings (build/marketlab.py)
+# 2) blend with the analysts. Within each position, a player's analyst-consensus rank is turned into
+#    points using this league's own scoring: the analysts' k-th goalie gets our k-th goalie's points.
+#    Our model decides how much a position is worth here; the analysts help decide who is good
+#    (depth charts, injuries, new teams, prospects). How far each player moves toward the analysts
+#    was tested on four past seasons (build/expertlab.py, build/experts.py).
+ADP_FLOOR = EX.ADP_FLOOR
 solve_repl(allp)
-for s in ["C", "W", "D", "G"]:
-    allp["model_" + s] = allp["pts_" + s]
+for s_ in ["C", "W", "D", "G"]:
+    allp["model_" + s_] = allp["pts_" + s_]
 allp["prim"] = allp.slot
+allp["k"] = allp.nm.map(enorm)
+allp["rookie"] = allp.get("rookie", False).fillna(False).astype(bool) if "rookie" in allp else False
+allp["moved"] = [(isinstance(t, str) and isinstance(l, str) and t != "" and t != l) for t, l in zip(allp.team, allp.get("team_last", pd.Series(index=allp.index)))]
+allp["exp_score"], allp["exp_n"] = EX.consensus(allp, allp.kind.eq("G"))
 allp["market_pts"] = np.nan
-for s in ["C", "W", "D", "G"]:
-    grp = allp[allp.prim == s]
-    ours = np.sort(grp["pts_" + s].values)[::-1]
-    drafted = grp.adp.notna() & (grp.adp < ADP_FLOOR)
-    with_adp = grp[drafted].sort_values("adp")
-    no_adp = grp[~drafted].sort_values("pts_" + s, ascending=False)
-    order = list(with_adp.index) + list(no_adp.index)
-    for k, idx in enumerate(order):
-        allp.at[idx, "market_pts"] = ours[min(k, len(ours) - 1)]
-w = allp.prim.map(W_MODEL)
-own_pts = allp.apply(lambda r: r["pts_" + r.prim], axis=1)
-delta = (1 - w) * (allp.market_pts - own_pts)
-for s in ["C", "W", "D", "G"]:
-    allp["pts_" + s] = allp["pts_" + s] + delta.where(allp["pts_" + s].notna())
 allp["market_rank_pos"] = np.nan
-for s in ["C", "W", "D", "G"]:
-    grp = allp[(allp.prim == s) & allp.adp.notna() & (allp.adp < ADP_FLOOR)].sort_values("adp")
-    for k, idx in enumerate(grp.index):
+for s_ in ["C", "W", "D", "G"]:
+    grp = allp[allp.prim == s_]
+    ours = np.sort(grp["pts_" + s_].values)[::-1]
+    ranked = grp[grp.exp_score.notna()].sort_values("exp_score")
+    rest = grp[grp.exp_score.isna()].sort_values("pts_" + s_, ascending=False)
+    for k, idx in enumerate(list(ranked.index) + list(rest.index)):
+        allp.at[idx, "market_pts"] = ours[min(k, len(ours) - 1)]
+    for k, idx in enumerate(ranked.index):
         allp.at[idx, "market_rank_pos"] = k + 1
+allp["w_exp"] = EX.weights(allp)
+inj = allp.miss > 0
+allp.loc[inj & allp.kind.eq("S") & ~allp.rookie, "w_exp"] = allp.loc[inj & allp.kind.eq("S") & ~allp.rookie, "w_exp"].clip(upper=0.10)
+allp.loc[inj & allp.kind.eq("G"), "w_exp"] = allp.loc[inj & allp.kind.eq("G"), "w_exp"].clip(upper=0.30)
+own_pts = allp.apply(lambda r: r["pts_" + r.prim] if isinstance(r.prim, str) else np.nan, axis=1)
+delta = allp.w_exp * (allp.market_pts - own_pts)
+for s_ in ["C", "W", "D", "G"]:
+    allp["pts_" + s_] = allp["pts_" + s_] + delta.where(allp["pts_" + s_].notna())
+print("expert weights used:", allp.groupby(["kind"]).w_exp.describe()[["mean", "min", "max"]].round(2).to_dict("index"))
+W_MODEL = {"C": 0.95, "W": 0.8, "D": 0.8, "G": 0.35}  # typical share kept from our own model (see experts.weights)
 
 repl = solve_repl(allp)
 print("replacement:", {k: round(v, 1) for k, v in repl.items()})
@@ -183,10 +234,16 @@ def chips(r):
     if pd.notna(r.get("market_rank_pos")) and r.get("rookie") != True:
         pn = {"C": "center", "W": "winger", "D": "defenseman", "G": "goalie"}[r.slot]
         mr, orank = int(r.market_rank_pos), int(r.model_rank_pos)
+        pull = "a lot" if r.w_exp >= 0.5 else "partway" if r.w_exp >= 0.3 else "a little" if r.w_exp >= 0.15 else "only slightly"
         if mr >= orank + 8 and mr > 6:
-            c.append(("info", f"Our stats like him more than drafters do: they take him as about the {ordinal(mr)} {pn}, we have him {ordinal(orank)}. The market may know something (role, depth chart), so his number is pulled partway toward theirs."))
+            c.append(("info", f"Our stats like him more than the analysts do: they have him around the {ordinal(mr)} {pn}, we have him {ordinal(orank)}. His number is pulled {pull} toward theirs."))
         elif orank >= mr + 8 and orank > 6:
-            c.append(("info", f"Drafters like him more than our stats do: about the {ordinal(mr)} {pn} taken vs {ordinal(orank)} for us. His number is pulled partway toward theirs."))
+            c.append(("info", f"Analysts like him more than our stats do: around the {ordinal(mr)} {pn} for them vs {ordinal(orank)} for us. His number is pulled {pull} toward theirs."))
+    if isinstance(r.get("inj_note"), str):
+        c.insert(0, ("bad", f"Injury: {r.inj_note} We take off about {int(r.miss)} games."))
+    note = NEWS.NOTES.get(r.nm)
+    if note:
+        c.insert(0, ("info", "Camp news: " + note))
     if pd.notna(r.get("age")):
         if r.age >= 33: c.append(("bad", f"Age {int(r.age)} this season: some decline built in."))
         elif r.age <= 23 and r.get("rookie") != True: c.append(("good", f"Age {int(r.age)} this season: still improving, growth built in."))
@@ -209,6 +266,10 @@ for i, r in allp.iterrows():
              age=None if pd.isna(r.get("age")) else int(r.age), rk=1 if rookie else 0, nt=1 if r.no_team else 0,
              ch=chips(r))
     p["slotpts"] = {s: rnd(r["pts_" + s], 0) for s in r.slots if pd.notna(r["pts_" + s])}
+    p["gm"] = int(round(r.tg - r.miss))          # team games he can play in the fantasy season
+    if r.miss > 0:
+        p["ret"] = r.inj_ret; p["miss"] = int(r.miss)
+    p["wx"] = rnd(r.w_exp, 2)
     if kind == "S" and not rookie:
         gp = r.proj_gp; blend = r.proj_pts_final / (r.ppg * gp) if r.ppg * gp else 1
         sc = M.SK[r.slot]
@@ -252,9 +313,19 @@ meta = dict(
     scoring=dict(C=M.SK["C"], W=M.SK["W"], D=M.SK["D"], common=M.COMMON, goalie=M.GOALIE),
     periods=len(league["scoringPeriods"]), playoffTeams=league["playoffs"]["numPlayoffTeams"],
     firstPlayoff=league["playoffs"]["firstPlayoffPeriod"], seasonStart=league["startDate"],
-    defaultTeam="bx8lngpymo5yu9nq",
+    defaultTeam="nuevz47fmo5yu9nr",
 )
 meta["backtest"] = json.load(open("data/report.json"))
+TIDX = sorted(TG)
+days = {}
+for g in FGAMES:
+    days.setdefault(g["date"], []).extend([TIDX.index(g["home"]), TIDX.index(g["away"])])
+meta["sched"] = dict(teams=TIDX, days=[[d, sorted(v)] for d, v in sorted(days.items())])
+meta["periodDates"] = [[pp["number"], pp["startDate"], pp["endDate"]] for pp in PERIODS]
+meta["matchups"] = [[m["period"], [[x["away"]["id"], x["home"]["id"]] for x in m["matchupList"]]] for m in league["matchups"]]
+meta["experts"] = dict(sources=EX.SOURCES_TEXT, asOf=NEWS.AS_OF, n=len(EX.SOURCES_TEXT))
+meta["newsAsOf"] = NEWS.AS_OF
+meta["expTest"] = json.load(open("data/expert_report.json"))
 meta["adpNote"] = "Fantrax average draft position across all Fantrax NHL drafts, as of " + datetime.date.today().isoformat()
 import os; os.makedirs("site/data", exist_ok=True)
 with open("site/data/board.js", "w") as f:
