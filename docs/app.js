@@ -42,6 +42,7 @@ const S = {
   team: startTeam(),
   tab: startTab(),
   pos: "ALL", q: "", faOnly: LS.get("zb-fa", false), sort: "ros", show: 60, open: null,
+  tmode: ["both", "me", "yes", "weak"].includes(LS.get("zb-tmode", "both")) ? LS.get("zb-tmode", "both") : "both", tteam: "ALL",
   addMode: LS.get("zb-addmode", "ros"), addPos: "ALL", addOpen: null, addShow: 25,
   stars: LS.get("zb-stars", {}),
   gsOv: LS.get("zb-gs", {}),       // goalie id -> season starts
@@ -408,22 +409,9 @@ function tradeSearch(me, onProgress) {
     const step = () => {
       const T = others[i];
       if (!T) {
-        const ok = found.filter((d) => d.me >= 8 && ((d.them >= 0 && d.ratio >= 0.85) || (d.them >= -10 && d.ratio >= 1.0)));
-        for (const d of ok) {
-          d.likely = d.them >= 0 && d.ratio >= 1.0;
-          d.score = d.me + (d.likely ? 12 : 0) - 4 * (d.give.length + d.get.length - 2);
-        }
-        ok.sort((a, b) => b.score - a.score);
-        const perTeam = {}, perPl = {}, out = [];
-        for (const d of ok) {
-          const ids = d.give.concat(d.get).map((p) => p.id);
-          if ((perTeam[d.team] || 0) >= 2 || ids.some((id) => (perPl[id] || 0) >= 2)) continue;
-          perTeam[d.team] = (perTeam[d.team] || 0) + 1; ids.forEach((id) => (perPl[id] = (perPl[id] || 0) + 1));
-          out.push(d);
-          if (out.length >= 10) break;
-        }
-        MEMO.set(key, out);
-        resolve(out);
+        for (const d of found) d.likely = d.them >= 0 && d.ratio >= 1.0;
+        MEMO.set(key, found);
+        resolve(found);
         return;
       }
       if (onProgress) onProgress(i, others.length, T);
@@ -452,6 +440,33 @@ function tradeSearch(me, onProgress) {
   });
 }
 // plain-English reasons: which parts of each lineup get better or worse
+// the same pool of deals, sorted for different goals
+const TMODES = {
+  both: { label: "Best for both", tip: "Deals that help both teams the most. The easiest ones to get done." },
+  me: { label: "Best for me", tip: "The biggest boost for you that still looks fair enough to propose." },
+  yes: { label: "Easiest yes", tip: "Deals they're most likely to accept: they gain in their lineup and in name value." },
+  weak: { label: "Fix weak spot", tip: "Deals that bring in a player at your weakest position." },
+};
+function weakestSlot(team) { const r = leagueShapes().rank[team] || {}; return SLOTS.slice().sort((a, b) => (r[b] || 0) - (r[a] || 0))[0]; }
+function pickDeals(all, mode, teamF, limit, exempt) {
+  const weak = weakestSlot(S.team);
+  let L = all.filter((d) => d.me >= 5 && (!teamF || teamF === "ALL" || d.team === teamF));
+  const extra = (d) => 4 * (d.give.length + d.get.length - 2);
+  if (mode === "both") { L = L.filter((d) => d.them >= 0 && d.ratio >= 0.9); L.sort((a, b) => Math.min(b.me, b.them) - extra(b) - (Math.min(a.me, a.them) - extra(a))); }
+  else if (mode === "yes") { L = L.filter((d) => d.them >= 0 && d.ratio >= 1.0); const y = (d) => Math.min(d.them, 60) + 60 * Math.min(d.ratio - 1, 0.5) + 0.2 * d.me - extra(d); L.sort((a, b) => y(b) - y(a)); }
+  else if (mode === "weak") { L = L.filter((d) => d.them >= -15 && d.ratio >= 0.85 && d.get.some((p) => elig(p).includes(weak))); L.sort((a, b) => b.me - extra(b) - (a.me - extra(a))); }
+  else { L = L.filter((d) => d.them >= -15 && d.ratio >= 0.85); L.sort((a, b) => b.me - extra(b) + (b.likely ? 8 : 0) - (a.me - extra(a) + (a.likely ? 8 : 0))); }
+  const perTeam = {}, perPl = {}, out = [];
+  for (const d of L) {
+    const ids = d.give.concat(d.get).map((p) => p.id);
+    if (!teamF || teamF === "ALL") { if ((perTeam[d.team] || 0) >= 2) continue; }
+    if (ids.some((id) => id !== exempt && (perPl[id] || 0) >= 2)) continue;
+    perTeam[d.team] = (perTeam[d.team] || 0) + 1; ids.forEach((id) => (perPl[id] = (perPl[id] || 0) + 1));
+    out.push(d);
+    if (out.length >= (limit || 10)) break;
+  }
+  return out;
+}
 function tradeReasons(me, them, d) {
   const days = rosDays();
   const s0 = teamShape(me), s1 = shapeOf(d.a ? d.a.r : afterTrade(me, rosterOf(me), d.give, d.get).r, days);
@@ -597,10 +612,10 @@ function renderTeam() {
   el.querySelectorAll("[data-bo]").forEach((b) => (b.onclick = () => { S.addMode = "bo"; LS.set("zb-addmode", "bo"); setTab("adds"); }));
   el.querySelectorAll("[data-scroll]").forEach((b) => (b.onclick = () => { const t = document.getElementById(b.dataset.scroll); if (t) t.scrollIntoView({ behavior: "smooth", block: "start" }); }));
   const team = S.team;
-  tradeSearch(team).then((deals) => {
+  tradeSearch(team).then((all) => {
     const li = $("#todoTrade");
     if (!li || S.team !== team) return;
-    const d = deals[0];
+    const d = pickDeals(all, "both")[0] || pickDeals(all, "me")[0];
     li.innerHTML = d ? `<b>Propose a trade to ${esc(tname(d.team))}:</b> give ${d.give.map((p) => esc(p.n)).join(" + ")}, get ${d.get.map((p) => esc(p.n)).join(" + ")}. About ${sgn(d.me)} points for you this season${d.them >= 1 ? `, and it helps them too (${sgn(d.them)})` : d.them > -1 ? `, and it's about even for them` : ""}. <button class="linkbtn" data-tab="trades">All trade ideas</button>`
       : `<b>Trades:</b> no deal found that clearly helps both teams right now. <button class="linkbtn" data-tab="trades">Try the trade checker</button>`;
     li.querySelectorAll("[data-tab]").forEach((b) => (b.onclick = () => setTab(b.dataset.tab)));
@@ -764,7 +779,7 @@ function dealCard(d, i, key) {
   }
   return `<div class="deal ${d.likely ? "likely" : ""}">
     <button class="dh" data-deal="${key}:${i}" aria-expanded="${open}">
-      <div class="dt"><span>Trade with <b>${esc(tname(d.team))}</b></span><span class="pill ${d.likely ? "good" : d.me >= 0 ? "gold" : "bad"}">${d.likely ? "Likely yes" : d.me >= 0 ? "Worth asking" : "Doesn't help you"}</span></div>
+      <div class="dt"><span>Trade with <b>${esc(tname(d.team))}</b></span><span class="pill ${d.me < 0 ? "bad" : d.them >= 0 && d.ratio >= 0.9 ? "good" : "gold"}">${d.me < 0 ? "Doesn't help you" : d.likely ? "Likely yes" : d.them >= 0 && d.ratio >= 0.9 ? "Good for both" : d.them >= 0 ? "They may want a bit more" : "Better for you"}</span></div>
       <div class="sides"><div><div class="k">You give</div>${plist(d.give)}</div><div class="arrow">⇄</div><div><div class="k">You get</div>${plist(d.get)}</div></div>
       <div class="dn"><span>You <b class="${d.me >= 0 ? "gainv" : "lossv"}">${sgn(d.me)}</b> pts this season</span><span>Them <b class="${d.them >= 0 ? "gainv" : "lossv"}">${sgn(d.them)}</b></span><span class="tog">${open ? "Hide" : "Why?"}</span></div>
     </button>${body}</div>`;
@@ -781,8 +796,12 @@ function renderTrades() {
       <label for="shopSel"><b>Shop one of your players</b><span class="note">Find the best deals built around him</span></label>
       <select class="sel" id="shopSel"><option value="">Pick a player…</option>${mine.map((p) => `<option value="${p.id}" ${p.id === S.shopId ? "selected" : ""}>${esc(p.n)} (${esc((p.pos || p.slot).replace(/,/g, "/"))}, ${fmt(rosOf(p))} pts)</option>`).join("")}</select>
     </div>
+    <div class="tctl">
+      <div class="chips" role="group" aria-label="Sort deals">${Object.entries(TMODES).map(([k, m]) => `<button data-tmode="${k}" aria-pressed="${S.tmode === k}">${k === "weak" ? `Fix ${POSPL[weakestSlot(S.team)]}` : m.label}</button>`).join("")}</div>
+      <select class="sel" id="tteam" aria-label="Trade partner"><option value="ALL">All teams</option>${teamsOpt.map((t) => `<option value="${t.id}" ${t.id === S.tteam ? "selected" : ""}>${esc(t.name)}</option>`).join("")}</select>
+    </div>
+    <p class="note" id="tmodeTip" style="margin:-4px 0 10px">${esc(S.tmode === "weak" ? `Deals that bring in ${POSPL[weakestSlot(S.team)]}, your weakest position.` : TMODES[S.tmode].tip)}</p>
     <div id="shopBox"></div>
-    <h3 class="sectitle" style="margin-top:18px">Best deals overall</h3>
     <div id="dealsBox"><div class="empty" id="dealProg">Looking for fair deals across the league…</div></div>
     <h3 class="sectitle" style="margin-top:22px">Trade checker</h3>
     <p class="note" style="margin:-2px 0 10px">Got an offer, or have an idea? Pick the team, tap the players on each side, and see who wins.</p>
@@ -792,7 +811,9 @@ function renderTrades() {
       <div id="ckOut" class="ckout"></div>
     </div>`;
   $("#ckTeam").onchange = (e) => { S.ckTeam = e.target.value; S.ckGive = new Set(); S.ckGet = new Set(); renderChecker(); };
-  $("#shopSel").onchange = (e) => { S.shopId = e.target.value || null; S.tradeOpen = null; renderShop(); };
+  $("#shopSel").onchange = (e) => { S.shopId = e.target.value || null; S.tradeOpen = null; renderShop(); renderDealList(); };
+  el.querySelectorAll("[data-tmode]").forEach((b) => (b.onclick = () => { S.tmode = b.dataset.tmode; LS.set("zb-tmode", S.tmode); S.tradeOpen = null; renderTrades(); }));
+  $("#tteam").onchange = (e) => { S.tteam = e.target.value; S.tradeOpen = null; renderShopList(); renderDealList(); };
   renderChecker();
   const lists = { deals: () => S.deals || [], shop: () => S.shopDeals || [] };
   const onDeals = (e) => {
@@ -804,38 +825,52 @@ function renderTrades() {
     const b = e.target.closest("[data-deal]"); if (!b) return;
     S.tradeOpen = S.tradeOpen === b.dataset.deal ? null : b.dataset.deal;
     const k = b.dataset.deal.split(":")[0];
-    if (k === "shop") renderShopList(); else $("#dealsBox").innerHTML = `<div class="deals">${S.deals.map((d, i) => dealCard(d, i, "deals")).join("")}</div>`;
+    if (k === "shop") renderShopList(); else renderDealList();
   };
   $("#dealsBox").onclick = onDeals; $("#shopBox").onclick = onDeals;
   renderShop();
   const team = S.team;
-  tradeSearch(team, (i, n, T) => { const pg = $("#dealProg"); if (pg) pg.textContent = `Looking for fair deals… checking ${T.name} (${i + 1} of ${n})`; }).then((deals) => {
+  tradeSearch(team, (i, n, T) => { const pg = $("#dealProg"); if (pg) pg.textContent = `Looking for fair deals… checking ${T.name} (${i + 1} of ${n})`; }).then((all) => {
     if (S.team !== team || S.tab !== "trades") return;
-    S.deals = deals;
-    $("#dealsBox").innerHTML = deals.length ? `<div class="deals">${deals.map((d, i) => dealCard(d, i, "deals")).join("")}</div>`
-      : `<div class="empty">No trade found that clearly helps both teams right now. Use the checker below to test your own ideas.</div>`;
+    S.dealPool = all;
+    renderDealList();
   });
   if (S.shopId) setTimeout(() => { const x = $("#shopBox"); if (x) x.scrollIntoView({ behavior: "smooth", block: "start" }); }, 50);
 }
+function renderDealList() {
+  const box = $("#dealsBox"); if (!box || !S.dealPool) return;
+  if (S.shopId) { box.innerHTML = ""; return; }   // shopping one player: his list is shown instead
+  S.deals = pickDeals(S.dealPool, S.tmode, S.tteam);
+  const who = S.tteam && S.tteam !== "ALL" ? ` with ${esc(tname(S.tteam))}` : "";
+  box.innerHTML = S.deals.length ? `<div class="deals">${S.deals.map((d, i) => dealCard(d, i, "deals")).join("")}</div>`
+    : `<div class="empty">No deal${who} fits "${esc(S.tmode === "weak" ? "Fix weak spot" : TMODES[S.tmode].label)}" right now. Try another view, or build your own in the checker below.</div>`;
+}
 function renderShop() {
   const box = $("#shopBox"); if (!box) return;
-  if (!S.shopId) { box.innerHTML = ""; S.shopDeals = null; return; }
+  if (!S.shopId) { box.innerHTML = ""; S.shopDeals = null; S.shopPool = null; return; }
+  S.shopPool = null;
   const p = player(S.shopId), team = S.team, id = S.shopId;
   box.innerHTML = `<div class="empty" id="shopProg">Searching every team for deals built around ${esc(p.n)}…</div>`;
   shopSearch(team, id, (i, n, T) => { const pg = $("#shopProg"); if (pg) pg.textContent = `Searching for ${p.n}… checking ${T.name} (${i + 1} of ${n})`; }).then((deals) => {
     if (S.team !== team || S.shopId !== id || S.tab !== "trades") return;
-    S.shopDeals = deals;
+    S.shopPool = deals;
     renderShopList();
+    renderDealList();
   });
 }
 function renderShopList() {
   const box = $("#shopBox"); if (!box) return;
-  const p = player(S.shopId), deals = S.shopDeals || [];
+  if (!S.shopId || !S.shopPool) { box.innerHTML = S.shopId ? box.innerHTML : ""; return; }
+  const p = player(S.shopId);
+  let deals = pickDeals(S.shopPool, S.tmode, S.tteam, 8, S.shopId);
+  if (!deals.length) deals = S.shopPool.filter((d) => !S.tteam || S.tteam === "ALL" || d.team === S.tteam).sort((a, b) => b.me - a.me).slice(0, 5);
+  S.shopDeals = deals;
   const helps = deals.filter((d) => d.me > 0);
   const lead = !deals.length ? `No team has a fair deal for ${esc(p.n)} right now.`
     : helps.length ? `Best deals for ${esc(p.n)}, most helpful to you first.${analystsBacked(p) ? ` The experts rate him higher than our numbers do, so other managers should value him.` : ""}`
     : `Every fair deal for ${esc(p.n)} makes your team a bit worse, so keeping him is the better move. Here are the closest ones anyway.`;
-  box.innerHTML = `<p class="note shoplead">${lead}</p>${deals.length ? `<div class="deals">${deals.map((d, i) => dealCard(d, i, "shop")).join("")}</div>` : ""}`;
+  box.innerHTML = `<div class="shophead"><b>Deals for ${esc(p.n)}</b><button class="linkbtn" id="shopClear">Back to all deals</button></div><p class="note shoplead">${lead}</p>${deals.length ? `<div class="deals">${deals.map((d, i) => dealCard(d, i, "shop")).join("")}</div>` : ""}`;
+  const c = $("#shopClear"); if (c) c.onclick = () => { S.shopId = null; S.tradeOpen = null; $("#shopSel").value = ""; renderShopList(); renderDealList(); };
 }
 // every deal that sends this player out: him for one, him for two, or him plus a spare part for one
 function shopSearch(me, pid, onProgress) {
@@ -850,14 +885,8 @@ function shopSearch(me, pid, onProgress) {
     const step = () => {
       const T = others[i];
       if (!T) {
-        for (const d of found) { d.likely = d.them >= 0 && d.ratio >= 1.0 && d.me > 0; d.score = d.me + (d.likely ? 12 : 0) + Math.min(0, d.them) * 0.3 - 4 * (d.give.length + d.get.length - 2); }
-        found.sort((a, b) => b.score - a.score);
-        const perTeam = {}, out = [];
-        for (const d of found) {
-          if ((perTeam[d.team] || 0) >= 2) continue;
-          perTeam[d.team] = (perTeam[d.team] || 0) + 1; out.push(d);
-          if (out.length >= 8) break;
-        }
+        for (const d of found) d.likely = d.them >= 0 && d.ratio >= 1.0 && d.me > 0;
+        const out = found;
         MEMO.set(key, out); resolve(out); return;
       }
       if (onProgress) onProgress(i, others.length, T);
