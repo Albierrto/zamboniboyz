@@ -88,3 +88,17 @@ NOTES = {
     "Bowen Byram": "Traded to Chicago; top pair and top power play in preseason.",
     "Roman Kantserov": "Led the KHL with 36 goals; top line and top power play in Chicago's camp.",
 }
+
+
+# Camp roles that differ from last season (ice time and power-play minutes a game).
+# name: (expected TOI, expected PP TOI, confidence 0-1, note). Confidence < 1 because camp lines move.
+# Counting stats scale with the change: goals/assists 75% by ice time and 25% by power-play time;
+# faceoffs, hits and blocks by ice time. Once games start, the refresh job uses real ice time instead.
+ROLE = {
+    "Anton Lundell": (16.0, 1.2, 0.8, "Barkov is healthy again, so Lundell drops back to third-line center (with Luostarinen and Vilmanis in camp, The Hockey News, Sep 18-20). Last season's top-line minutes came from Barkov's injury."),
+    "Sam Bennett": (17.3, 2.4, 0.8, "With Barkov back, Bennett returns to second-line center (with Verhaeghe and Matthew Tkachuk in camp, The Hockey News, Sep 18-20)."),
+    "Jordan Kyrou": (14.8, 1.4, 0.6, "Third line and second power-play unit in Washington's camp, not the top six (RMNB, THN, Sep 17-19)."),
+    "Matthew Knies": (18.5, 1.4, 0.6, "Top line, but on the second power-play unit at the Sep 19 practice (THN, MLHS)."),
+    "Victor Hedman": (21.0, 1.5, 0.6, "Expected to drop to the second power play behind John Carlson (RotoWire, Sep 24)."),
+    "Dylan Cozens": (17.5, 3.0, 0.6, "Net-front man on Ottawa's top power play, Brady Tkachuk's old job (THN, Sep 23)."),
+}

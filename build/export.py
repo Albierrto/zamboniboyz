@@ -32,6 +32,31 @@ allp = pd.concat([S, G, R], ignore_index=True)
 allp = allp[allp.proj_pts.notna()].copy()
 allp["nm"] = [n if isinstance(n, str) else f for n, f in zip(allp["name"], allp.fname)]
 
+# ---- camp roles (news.ROLE): scale counting stats by the change in ice time / power-play time ----
+allp["role_note"] = None
+for nm, (toi_new, pp_new, conf, note) in NEWS.ROLE.items():
+    idx = allp.index[(allp.nm == nm) & allp.kind.eq("S")]
+    for i in idx:
+        r = allp.loc[i]
+        if not (r.toi and r.toi > 0): continue
+        rt = toi_new / r.toi; rp = pp_new / r.pptoi if r.pptoi and r.pptoi > 0.2 else 1.0
+        f_off = 1 - conf * (1 - (0.75 * rt + 0.25 * rp))
+        f_toi = 1 - conf * (1 - rt)
+        old = {s_: M.skater_ppg(pd.DataFrame([r[M.CATS]]), s_).iloc[0] for s_ in ["C", "W", "D"]}
+        for c_ in ["g", "a"]: allp.at[i, c_] = r[c_] * f_off
+        for c_ in ["fow", "hit", "blk", "shots"]: allp.at[i, c_] = r[c_] * f_toi
+        new = {s_: M.skater_ppg(pd.DataFrame([allp.loc[i, M.CATS]]), s_).iloc[0] for s_ in ["C", "W", "D"]}
+        for s_ in ["C", "W", "D"]:
+            if pd.notna(r.get("ppg_" + s_)) and old[s_] > 0:
+                allp.at[i, "ppg_" + s_] = r["ppg_" + s_] * new[s_] / old[s_]
+        b_ = r.best_slot if isinstance(r.best_slot, str) else "W"
+        f_best = new[b_] / old[b_] if old[b_] > 0 else 1
+        allp.at[i, "ppg"] = r.ppg * f_best
+        allp.at[i, "proj_pts"] = r.proj_pts * f_best
+        allp.at[i, "toi"] = r.toi + conf * (toi_new - r.toi); allp.at[i, "pptoi"] = r.pptoi + conf * (pp_new - r.pptoi)
+        allp.at[i, "role_note"] = note
+        print(f"role: {nm} x{f_best:.2f} ({r.proj_pts:.0f} -> {r.proj_pts * f_best:.0f})")
+
 # ---- 2026-27 schedule: 84 games, but the fantasy season ends with the last scoring period ----
 SCHED = json.load(open("data/raw/sched/2027.json"))
 PERIODS = league["scoringPeriods"]
@@ -242,8 +267,10 @@ def chips(r):
     if isinstance(r.get("inj_note"), str):
         c.insert(0, ("bad", f"Injury: {r.inj_note} We take off about {int(r.miss)} games."))
     note = NEWS.NOTES.get(r.nm)
-    if note:
+    if note and not isinstance(r.get("role_note"), str):
         c.insert(0, ("info", "Camp news: " + note))
+    if isinstance(r.get("role_note"), str):
+        c.insert(0, ("info", "New role: " + r.role_note + " His projection is adjusted for it."))
     if pd.notna(r.get("age")):
         if r.age >= 33: c.append(("bad", f"Age {int(r.age)} this season: some decline built in."))
         elif r.age <= 23 and r.get("rookie") != True: c.append(("good", f"Age {int(r.age)} this season: still improving, growth built in."))
@@ -292,6 +319,14 @@ for i, r in allp.iterrows():
         p["pid"] = int(r.playerId)
     players.append(p)
 
+# preseason breakout chances (build/breakout.py): chance a waiver-level skater plays like a fantasy starter
+BO = json.load(open("data/breakout_2027.json"))
+for p in players:
+    b = BO["players"].get(p["id"])
+    if b and (p["val"] is None or p["val"] < 0):
+        p["bo"] = [b["p"], b["pb"]]
+        if b["why"]: p["bw"] = b["why"]
+
 # keep the board a sensible size: everything kept, on the ADP list, or with value above -60
 players = [p for p in players if p["own"] or p["adp"] is not None or (p["val"] is not None and p["val"] > -60)]
 # tiers by value
@@ -326,6 +361,10 @@ meta["matchups"] = [[m["period"], [[x["away"]["id"], x["home"]["id"]] for x in m
 meta["experts"] = dict(sources=EX.SOURCES_TEXT, asOf=NEWS.AS_OF, n=len(EX.SOURCES_TEXT))
 meta["newsAsOf"] = NEWS.AS_OF
 meta["expTest"] = json.load(open("data/expert_report.json"))
+meta["breakout"] = dict(uplift=BO["uplift"], base=BO["base"], chg=7.06,
+    test=dict(auc=0.82, auc_proj=0.81, top30=0.50, base_rate=0.15, flag_hold=0.60, hot_hold="34-46%",
+              pre_miss=0.495, blend_miss=0.475, early_only_miss=1.196))
+meta["live"] = dict(raw="https://raw.githubusercontent.com/Albierrto/zamboniboyz/main/docs/data/live.json", local="data/live.json")
 meta["adpNote"] = "Fantrax average draft position across all Fantrax NHL drafts, as of " + datetime.date.today().isoformat()
 import os; os.makedirs("site/data", exist_ok=True)
 with open("site/data/board.js", "w") as f:
