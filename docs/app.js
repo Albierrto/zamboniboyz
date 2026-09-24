@@ -34,9 +34,13 @@ function startTeam() {
   return TEAMS[t] ? t : META.defaultTeam;
 }
 const TABS = ["team", "adds", "board", "league", "how"];
+function startTab() {  // everyone lands on My team once after the draft; after that the last tab is remembered
+  if (!LS.get("zb-home1", false)) { LS.set("zb-home1", true); LS.set("zb-tab", "team"); return "team"; }
+  const t = LS.get("zb-tab", "team"); return TABS.includes(t) ? t : "team";
+}
 const S = {
   team: startTeam(),
-  tab: TABS.includes(LS.get("zb-tab", "team")) ? LS.get("zb-tab", "team") : "team",
+  tab: startTab(),
   pos: "ALL", q: "", faOnly: LS.get("zb-fa", false), sort: "ros", show: 60, open: null,
   addMode: LS.get("zb-addmode", "ros"), addPos: "ALL", addOpen: null, addShow: 25,
   stars: LS.get("zb-stars", {}),
