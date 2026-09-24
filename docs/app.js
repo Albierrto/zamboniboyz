@@ -33,7 +33,7 @@ function startTeam() {
   if (!LS.get("zb-season", false)) { if (!t || t === OLD_DEFAULT) t = META.defaultTeam; LS.set("zb-season", true); LS.set("zb-team", t); }
   return TEAMS[t] ? t : META.defaultTeam;
 }
-const TABS = ["team", "adds", "board", "league", "how"];
+const TABS = ["team", "trades", "adds", "board", "league", "how"];
 function startTab() {  // everyone lands on My team once after the draft; after that the last tab is remembered
   if (!LS.get("zb-home1", false)) { LS.set("zb-home1", true); LS.set("zb-tab", "team"); return "team"; }
   const t = LS.get("zb-tab", "team"); return TABS.includes(t) ? t : "team";
@@ -93,6 +93,11 @@ function player(id) {
   return { id, n: nm, t: x && x.team && x.team !== "(N/A)" ? x.team : "", pos, slot: pos, pts: null, val: null, tier: 6, ch: [], slotpts: {}, gm: 0, unknown: true };
 }
 function elig(p) {
+  let e = EC.get(p.id);
+  if (!e) { e = elig0(p); EC.set(p.id, e); }
+  return e;
+}
+function elig0(p) {
   if (p.slot === "G") return ["G"];
   const k = Object.keys(p.slotpts || {});
   if (!k.length) return [p.slot];
@@ -107,8 +112,22 @@ function ptsAt(p, s) {
   if (s === "G") return ptsOf(p);
   return p.slotpts && p.slotpts[s] != null ? p.slotpts[s] : p.pts;
 }
-// points per team game at a slot (0 before he's back from injury)
-function rateAt(p, s) { const x = ptsAt(p, s); return p.gm > 0 && x != null ? x / p.gm : 0; }
+// points per team game at a slot (0 before he's back from injury).
+// MKT.on = score players the way the analysts see them (used for "would they see it as fair?")
+const MKT = { on: false };
+const RC = new Map(), EC = new Map();
+function clearCaches() { MEMO.clear(); RC.clear(); EC.clear(); }
+function rateAt(p, s) {
+  const k = p.id + s + (MKT.on ? "m" : "");
+  let r = RC.get(k);
+  if (r === undefined) {
+    const x = ptsAt(p, s);
+    r = p.gm > 0 && x != null ? x / p.gm : 0;
+    if (MKT.on && p.mk != null && p.pts > 0 && !p.rk) r *= p.mk / p.pts;
+    RC.set(k, r);
+  }
+  return r;
+}
 function bestRate(p) { return Math.max(0, ...elig(p).map((s) => rateAt(p, s))); }
 function plays(p, day) { return !!p.t && day.teams.has(p.t) && (!p.ret || day.d >= p.ret); }
 const GL = new Map();
@@ -267,6 +286,160 @@ function pickups(team, mode) {
   });
 }
 
+/* ---------------- team shape: where your points come from ---------------- */
+const SLOTS = ["C", "W", "D", "G"];
+function shapeOf(list, days) {
+  const out = { C: 0, W: 0, D: 0, G: 0, total: 0 };
+  for (const day of days) {
+    const on = list.filter((p) => plays(p, day));
+    if (!on.length) continue;
+    const nl = nightLineup(on, true);
+    for (const p of on) { const s = nl.start.get(p.id); if (s) { const r = rateAt(p, s); out[s] += r; out.total += r; } }
+  }
+  return out;
+}
+function rosDays() { return memo("rosdays|" + fromDay(), () => windowDays("ros")); }
+function teamShape(team) { return memo("shape|" + rosterKey(team) + "|" + fromDay() + JSON.stringify(S.gsOv), () => shapeOf(rosterOf(team), rosDays())); }
+function leagueShapes() {
+  const all = META.teams.map((t) => ({ id: t.id, sh: teamShape(t.id) }));
+  const rank = {};
+  for (const s of [...SLOTS, "total"]) {
+    const sorted = all.slice().sort((a, b) => b.sh[s] - a.sh[s]);
+    sorted.forEach((x, i) => { (rank[x.id] = rank[x.id] || {})[s] = i + 1; });
+  }
+  const avg = {}; for (const s of [...SLOTS, "total"]) avg[s] = all.reduce((a, x) => a + x.sh[s], 0) / all.length;
+  return { all, rank, avg };
+}
+
+/* ---------------- trades ---------------- */
+const onIR = (id) => !!(S.live.status && S.live.status[id] === "INJURED_RESERVE");
+function vOf(list) {
+  const k = "v|" + (MKT.on ? "m|" : "") + list.map((p) => p.id).sort().join(",");
+  return memo(k, () => rangeValue(list, rosDays()));
+}
+function activeCount(list) { return list.filter((p) => !onIR(p.id)).length; }
+// what a roster looks like after a trade: extra bodies are cut (least useful first), a freed spot takes the team's best free agent
+function afterTrade(team, roster, out, inn) {
+  const outIds = new Set(out.map((p) => p.id));
+  let r = roster.filter((p) => !outIds.has(p.id)).concat(inn);
+  const cap = Math.max(META.roster.max, activeCount(roster));
+  const dropped = [];
+  let extra = activeCount(r) - cap;
+  while (extra-- > 0) {
+    const cands = r.filter((p) => !inn.includes(p) && !onIR(p.id)).sort((a, b) => bestRate(a) * gamesLeft(a, fromDay()) - bestRate(b) * gamesLeft(b, fromDay())).slice(0, 3);
+    let best = null;
+    for (const c of cands) { const v = vOf(r.filter((x) => x !== c)); if (!best || v > best.v) best = { c, v }; }
+    if (!best) break;
+    r = r.filter((x) => x !== best.c); dropped.push(best.c);
+  }
+  let added = null;
+  if (activeCount(r) < cap && inn.length < out.length) {
+    const fa = faFor(team, roster);
+    if (fa) { r = r.concat([fa]); added = fa; }
+  }
+  return { v: vOf(r), r, dropped, added };
+}
+// best free agent for a team that has an open spot (computed once per team)
+function faFor(team, roster) {
+  return memo("fa|" + (MKT.on ? "m|" : "") + rosterKey(team), () => {
+    const base = vOf(roster);
+    const pool = [];
+    const fa = freeAgents();
+    for (const s of SLOTS) pool.push(...fa.filter((p) => elig(p)[0] === s).sort((a, b) => rosOf(b) - rosOf(a)).slice(0, 4));
+    let best = null;
+    for (const p of pool) { const g = vOf(roster.concat([p])) - base; if (!best || g > best.g) best = { p, g }; }
+    return best && best.g > 0 ? best.p : null;
+  });
+}
+// how the other manager is likely to see a deal: name value, with stars worth more than the sum of lesser players.
+// Uses the analysts' view of each player in this league's scoring, above waiver level, to the power 1.5.
+function mval(p) { const x = p.mk != null && !p.rk ? p.mk : p.pts; return Math.pow(Math.max(0, (x || 0) - (REPL[p.slot] || 0)), 1.5); }
+function nameRatio(give, get) { // what they receive over what they send
+  const a = give.reduce((t, p) => t + mval(p), 0), b = get.reduce((t, p) => t + mval(p), 0);
+  return b > 0 ? a / b : a > 0 ? 9 : 1;
+}
+function evalTrade(me, them, give, get) {
+  const A = rosterOf(me), Bt = rosterOf(them);
+  const a = afterTrade(me, A, give, get), b = afterTrade(them, Bt, get, give);
+  return { me: a.v - vOf(A), them: b.v - vOf(Bt), a, b };
+}
+function tradeView(me, them, give, get) { return { ...evalTrade(me, them, give, get), ratio: nameRatio(give, get) }; }
+// search: one-for-one, two-for-one and one-for-two with every other team
+function tradeSearch(me, onProgress) {
+  const key = "deals|" + rosterKey(me) + "|" + META.teams.map((t) => rosterKey(t.id)).join(";") + JSON.stringify(S.gsOv) + fromDay();
+  if (MEMO.has(key)) return Promise.resolve(MEMO.get(key));
+  const A = rosterOf(me), vA = vOf(A);
+  const others = META.teams.filter((t) => t.id !== me);
+  const found = [];
+  const contrib = (list, v0) => list.filter((p) => !onIR(p.id)).map((p) => ({ p, c: v0 - vOf(list.filter((x) => x !== p)) })).sort((a, b) => a.c - b.c);
+  const myC = contrib(A, vA);
+  const myWorst = myC[0] && myC[0].p;
+  let i = 0;
+  return new Promise((resolve) => {
+    const step = () => {
+      const T = others[i];
+      if (!T) {
+        const ok = found.filter((d) => d.me >= 8 && ((d.them >= 0 && d.ratio >= 0.85) || (d.them >= -10 && d.ratio >= 1.0)));
+        for (const d of ok) {
+          d.likely = d.them >= 0 && d.ratio >= 1.0;
+          d.score = d.me + (d.likely ? 12 : 0) - 4 * (d.give.length + d.get.length - 2);
+        }
+        ok.sort((a, b) => b.score - a.score);
+        const perTeam = {}, perPl = {}, out = [];
+        for (const d of ok) {
+          const ids = d.give.concat(d.get).map((p) => p.id);
+          if ((perTeam[d.team] || 0) >= 2 || ids.some((id) => (perPl[id] || 0) >= 2)) continue;
+          perTeam[d.team] = (perTeam[d.team] || 0) + 1; ids.forEach((id) => (perPl[id] = (perPl[id] || 0) + 1));
+          out.push(d);
+          if (out.length >= 10) break;
+        }
+        MEMO.set(key, out);
+        resolve(out);
+        return;
+      }
+      if (onProgress) onProgress(i, others.length, T);
+      const Bt = rosterOf(T.id), vB = vOf(Bt);
+      const thC = contrib(Bt, vB);
+      const thWorst = thC[0] && thC[0].p;
+      // their players who'd help me, and my players who'd help them
+      const targets = Bt.filter((q) => !onIR(q.id)).sort((a, b) => rosOf(b) - rosOf(a)).slice(0, 12)
+        .map((q) => ({ q, g: vOf(A.filter((x) => x !== myWorst).concat([q])) - vA })).filter((x) => x.g > 3).sort((a, b) => b.g - a.g).slice(0, 6).map((x) => x.q);
+      const offers = A.filter((p) => !onIR(p.id))
+        .map((p) => ({ p, g: vOf(Bt.filter((x) => x !== thWorst).concat([p])) - vB })).filter((x) => x.g > 3).sort((a, b) => b.g - a.g).slice(0, 7).map((x) => x.p);
+      const tryDeal = (give, get) => {
+        const ratio = nameRatio(give, get);
+        if (ratio < 0.85 || ratio > 2.2) return;   // they'd laugh at it, or you'd be giving far too much
+        const r = evalTrade(me, T.id, give, get);
+        if (r.me > 0) found.push({ team: T.id, give, get, ratio, me: r.me, them: r.them, dropMe: r.a.dropped, addMe: r.a.added, dropThem: r.b.dropped, addThem: r.b.added });
+      };
+      for (const p of offers) for (const q of targets) tryDeal([p], [q]);
+      const o5 = offers.slice(0, 5), t4 = targets.slice(0, 4), t5 = targets.slice(0, 5), o4 = offers.slice(0, 4);
+      for (let x = 0; x < o5.length; x++) for (let y = x + 1; y < o5.length; y++) for (const q of t4) tryDeal([o5[x], o5[y]], [q]);
+      for (const p of o4) for (let x = 0; x < t5.length; x++) for (let y = x + 1; y < t5.length; y++) tryDeal([p], [t5[x], t5[y]]);
+      i++;
+      setTimeout(step, 0);
+    };
+    setTimeout(step, 0);
+  });
+}
+// plain-English reasons: which parts of each lineup get better or worse
+function tradeReasons(me, them, d) {
+  const days = rosDays();
+  const s0 = teamShape(me), s1 = shapeOf(d.a ? d.a.r : afterTrade(me, rosterOf(me), d.give, d.get).r, days);
+  const t0 = teamShape(them), t1 = shapeOf(d.b ? d.b.r : afterTrade(them, rosterOf(them), d.get, d.give).r, days);
+  const word = { C: "centers", W: "wingers", D: "defensemen", G: "goalies" };
+  const lines = (a, b, who) => SLOTS.map((s) => [s, b[s] - a[s]]).filter(([, x]) => Math.abs(x) >= 6).sort((x, y) => Math.abs(y[1]) - Math.abs(x[1]))
+    .map(([s, x]) => `${who} ${word[s]} ${x > 0 ? "get better" : "get worse"} (${sgn(x)})`);
+  const dm = SLOTS.map((s) => [s, s1[s] - s0[s]]), dt = SLOTS.map((s) => [s, t1[s] - t0[s]]);
+  const up = dm.filter(([, x]) => x >= 6).sort((a, b) => b[1] - a[1])[0], down = dm.filter(([, x]) => x <= -6).sort((a, b) => a[1] - b[1])[0];
+  const tup = dt.filter(([, x]) => x >= 6).sort((a, b) => b[1] - a[1])[0];
+  let lead = "";
+  if (up && down) lead = `You turn depth at ${word[down[0]]} into help at ${word[up[0]]}.`;
+  else if (up) lead = `Your ${word[up[0]]} get better without hurting anything else much.`;
+  if (tup) lead += ` They get help at ${word[tup[0]]}, which is why they might say yes.`;
+  return { me: lines(s0, s1, "Your"), them: lines(t0, t1, "Their"), lead: lead.trim() };
+}
+
 /* ---------------- status strip ---------------- */
 function renderStrip() {
   const el = $("#clock");
@@ -301,64 +474,104 @@ function renderTeam() {
   const myWk = rangeValue(roster, wk);
   const oppWk = opp ? rangeValue(rosterOf(opp), wk) : null;
   const started = todayET() > per.s;
-  const season = META.teams.map((t) => ({ id: t.id, v: memo("ros|" + rosterKey(t.id) + "|" + from + JSON.stringify(S.gsOv), () => rangeValue(rosterOf(t.id), daysIn(from, SEASON_END))) })).sort((a, b) => b.v - a.v);
-  const rank = season.findIndex((x) => x.id === S.team) + 1;
-  const mine = season.find((x) => x.id === S.team);
+  const LSH = leagueShapes();
+  const rk = LSH.rank[S.team] || {};
+  const mine = LSH.all.find((x) => x.id === S.team).sh;
   const lu = fillLineup(roster);
-  const adds = pickups(S.team, "ros").list.filter((x) => x.gain >= 3);
+  const adds = pickups(S.team, "ros").list.filter((x) => x.gain >= 5);
   const games = roster.reduce((a, p) => a + gamesIn(p, wk), 0), oppGames = opp ? rosterOf(opp).reduce((a, p) => a + gamesIn(p, wk), 0) : 0;
-
-  // alerts
-  const alerts = [];
+  const word = { C: "centers", W: "wingers", D: "defensemen", G: "goalies" };
+  const weak = SLOTS.slice().sort((a, b) => rk[b] - rk[a]).filter((s) => rk[s] >= 7).slice(0, 2);
+  const strong = SLOTS.filter((s) => rk[s] <= 4);
   const inj = roster.filter(hurt);
-  if (inj.length) alerts.push(`<b>Hurt:</b> ${inj.map((p) => `${esc(p.n)} (back ~${esc(dLabel(p.ret, { month: "short", day: "numeric" }))})`).join(", ")}. If Fantrax lists him as injured, an IR spot frees a roster spot for a pickup.`);
-  const idle = roster.filter((p) => !hurt(p) && gamesIn(p, wk) === 0);
-  if (idle.length && wk.length) alerts.push(`<b>No games ${started ? "left " : ""}this week:</b> ${idle.map((p) => esc(p.n)).join(", ")}.`);
-  if (adds.length) {
-    const d = adds[0].drop;
-    alerts.push(`<b>Best pickup:</b> ${esc(adds[0].p.n)} for ${esc(d.n)}, about ${sgn(adds[0].gain)} points over the rest of the season.${analystsBacked(d) ? ` Analysts rank ${esc(d.n)} far higher than our stats do (${ordinal(d.mr)} ${esc(d.slot)} vs our ${ordinal(d.orank)}), so see what he gets you in a trade before dropping him.` : ""} <button class="linkbtn" data-tab="adds">See pickups</button>`);
+
+  // the next night any of your players has a game
+  const night = DAYS.find((x) => x.d >= todayET() && roster.some((p) => plays(p, x)));
+  let lineupHTML = "";
+  if (night) {
+    const on = roster.filter((p) => plays(p, night));
+    const nl = nightLineup(on, true);
+    const bySlot = { C: [], W: [], D: [], G: [] };
+    for (const p of on) { const s = nl.start.get(p.id); if (s) bySlot[s].push(p); }
+    const sit = on.filter((p) => !nl.start.has(p.id));
+    const off = roster.filter((p) => !plays(p, night));
+    const slotLine = (s) => { const n = CAP[s] - bySlot[s].length; return `<div class="lgrp"><div class="lh">${POSNAME[s]}<small>${bySlot[s].length} of ${CAP[s]}${n ? ` · ${n} empty` : ""}</small></div>${bySlot[s].map((p) => `<button class="lp" data-open="${esc(p.id)}">${face(p)}<span>${esc(p.n)}${s !== p.slot ? `<small>put him in a ${s} spot</small>` : ""}</span><b class="num">${fmt(rateAt(p, s), 1)}</b></button>`).join("")}${!bySlot[s].length ? `<div class="lp empty"><span>None of your ${POSPL[s]} play this night</span></div>` : ""}</div>`; };
+    const empties = SLOTS.reduce((a, s) => a + CAP[s] - bySlot[s].length, 0);
+    lineupHTML = `<div class="tonight" id="tonight">
+      <div class="th2"><div><div class="k">Set your lineup for</div><div class="d">${esc(dLabel(night.d, { weekday: "long", month: "short", day: "numeric" }))}</div></div><div class="tp"><b class="num">${fmt(nl.total, 1)}</b><small>expected pts</small></div></div>
+      <p class="note">In Fantrax, put these players in your starting spots. Numbers are expected points that night.</p>
+      <div class="lgrid">${SLOTS.map(slotLine).join("")}</div>
+      <div class="benchline">${sit.length ? `<div><b>Bench these (they play, but your starters are better):</b> ${sit.map((p) => esc(p.n)).join(", ")}</div>` : ""}${off.length ? `<div><b>No game this night:</b> ${off.map((p) => esc(p.n)).join(", ")}</div>` : ""}${empties >= 3 ? `<div>${empties} starting spots are empty that night. A free agent who plays then is free points: see <button class="linkbtn" data-tab="adds">Pickups → This week</button>.</div>` : ""}</div>
+      <p class="note">Goalies only score if they actually start. Starters are usually confirmed the morning of the game: check <a href="https://www.dailyfaceoff.com/starting-goalies/" target="_blank" rel="noopener">Daily Faceoff's starting goalies</a> and bench a goalie who's sitting.</p>
+    </div>`;
   }
 
-  // day by day for this week
+  // to-do list (the trade line fills in when the search finishes)
+  const todo = [];
+  if (night) todo.push(`<li><b>Set your lineup for ${esc(dLabel(night.d, { weekday: "long" }))}.</b> It's worked out for you below. Do it again each game day: only players with a game can score. <button class="linkbtn" data-scroll="tonight">Show me</button></li>`);
+  todo.push(`<li id="todoTrade"><b>Trade for help at ${esc(weak.length ? word[weak[0]] : "your weakest spot")}.</b> <span class="note">Looking for fair deals…</span></li>`);
+  const addPick = adds.find((x) => !analystsBacked(x.drop));
+  if (addPick) {
+    todo.push(`<li><b>Pick up ${esc(addPick.p.n)}</b> (${esc(addPick.p.t)}) and drop ${esc(addPick.drop.n)}: about ${sgn(addPick.gain)} points for the rest of the season. <button class="linkbtn" data-tab="adds">All pickups</button></li>`);
+  }
+  const chip = roster.filter(analystsBacked).sort((a, b) => mval(b) - mval(a))[0];
+  if (chip) todo.push(`<li><b>Shop ${esc(chip.n)} in trades.</b> The experts rank him ${ordinal(chip.mr)} among ${POSPL[chip.slot]}, but our numbers have him ${ordinal(chip.orank)} for this league's scoring, so other managers will likely value him more than he helps you. Use him to get what you need.</li>`);
+  if (inj.length) todo.push(`<li><b>Move ${inj.map((p) => esc(p.n)).join(", ")} to IR</b> in Fantrax once he's listed as injured. IR spots don't count toward your 18, so you can add a healthy player.</li>`);
+  todo.push(`<li><b>Check goalies each game day.</b> A goalie who doesn't start scores nothing, so swap him out if he's on the bench.</li>`);
+
+  const shapeRows = SLOTS.map((s) => {
+    const r = rk[s], pct = Math.min(100, (100 * mine[s]) / Math.max(...LSH.all.map((x) => x.sh[s])));
+    const tone = r <= 4 ? "good" : r >= 9 ? "bad" : "";
+    return `<div class="shp"><span>${POSNAME[s] === "Defense" ? "Defense" : POSPL[s][0].toUpperCase() + POSPL[s].slice(1)}</span><span class="t"><i class="${tone}" style="width:${pct}%"></i></span><b class="${tone}">${ordinal(r)}</b></div>`;
+  }).join("");
+
   const dayRows = wk.map((day) => {
     const on = roster.filter((p) => plays(p, day));
     const nl = nightLineup(on, true);
     const sit = on.filter((p) => !nl.start.has(p.id));
     const cnt = { C: 0, W: 0, D: 0, G: 0 };
     for (const s of nl.start.values()) cnt[s]++;
-    const empty = ["C", "W", "D", "G"].filter((s) => cnt[s] < CAP[s]).map((s) => `${CAP[s] - cnt[s]} ${s}`);
+    const empty = SLOTS.filter((s) => cnt[s] < CAP[s]).map((s) => `${CAP[s] - cnt[s]} ${s}`);
     return `<div class="day ${day.d === todayET() ? "today" : ""}"><div class="dd"><b>${esc(dLabel(day.d, { weekday: "short" }))}</b><span>${esc(dLabel(day.d, { month: "short", day: "numeric" }))}</span></div>
       <div class="di"><div><b>${on.length}</b> playing · <span class="num">${fmt(nl.total, 1)}</span> pts</div>
-      ${sit.length ? `<div class="sit">Sits: ${sit.map((p) => esc(p.n)).join(", ")}</div>` : ""}
-      ${empty.length && on.length ? `<div class="gap">Empty: ${empty.join(", ")}</div>` : ""}${!on.length ? `<div class="gap">Nobody plays</div>` : ""}</div></div>`;
+      ${sit.length ? `<div class="sit">Bench: ${sit.map((p) => esc(p.n)).join(", ")}</div>` : ""}
+      ${empty.length && on.length ? `<div class="gap">Empty spots: ${empty.join(", ")}</div>` : ""}${!on.length ? `<div class="gap">Nobody plays</div>` : ""}</div></div>`;
   }).join("");
 
   const slotRow = (x, s) => rowMini(x.p, rosAt(x.p, s), s);
   const grp = (s, label) => `<div class="slotgrp"><h3>${label}<small>${lu.slots[s].length} of ${CAP[s]}</small></h3>${lu.slots[s].map((x) => slotRow(x, s)).join("")}${Array.from({ length: Math.max(0, lu.needs[s]) }, () => `<div class="slot open"><div class="open-ic"></div><div class="nm">Open spot<small>check Pickups</small></div><b></b></div>`).join("")}</div>`;
+  const summary = `Projected <b>${ordinal(rk.total)} of 12</b> for the season.${weak.length ? ` Weakest spot: <b>${word[weak[0]]}</b> (${ordinal(rk[weak[0]])} in the league)${weak[1] ? `, then ${word[weak[1]]} (${ordinal(rk[weak[1]])})` : ""}.` : ""}${strong.length ? ` You're strong at ${strong.map((s) => word[s]).join(" and ")}.` : ""} The list below is how to climb.`;
   el.innerHTML = `
-    <div class="lede"><h2>${esc(tname(S.team))}</h2><p>${esc(started || todayET() >= SEASON_START ? "Rest-of-season projections, this week's games and who to pick up." : "Your roster going into the season: who starts, this week's games and who to pick up.")}</p></div>
+    <div class="lede"><h2>${esc(tname(S.team))}</h2><p>${summary}</p></div>
+    <div class="todo"><h3>What to do</h3><ol>${todo.join("")}</ol></div>
     ${opp ? `<div class="matchup">
-      <div class="mh"><span>${isPlayoffs(per.n) ? "Playoffs · " : ""}Week ${per.n} · ${esc(dLabel(per.s, { month: "short", day: "numeric" }))} to ${esc(dLabel(lastDayOf(per), { month: "short", day: "numeric" }))}</span><span>${started ? "rest of week" : "projected"}</span></div>
-      <div class="side me"><div class="tn">${esc(tname(S.team))}<small>${games} games</small></div><b class="num">${fmt(myWk)}</b><div class="mbar"><i style="width:${(100 * myWk) / Math.max(myWk, oppWk, 1)}%"></i></div></div>
-      <div class="side"><div class="tn">${esc(tname(opp))}<small>${oppGames} games</small></div><b class="num">${fmt(oppWk)}</b><div class="mbar"><i style="width:${(100 * oppWk) / Math.max(myWk, oppWk, 1)}%"></i></div></div>
-      <div class="mf">${myWk >= oppWk ? `You're projected to win by about <b>${fmt(myWk - oppWk)}</b>.` : `You're projected to lose by about <b>${fmt(oppWk - myWk)}</b>. A pickup with extra games this week can close it.`} Assumes you set your best lineup every day.</div>
+      <div class="mh"><span>${isPlayoffs(per.n) ? "Playoffs · " : ""}Week ${per.n} matchup · ${esc(dLabel(per.s, { month: "short", day: "numeric" }))} to ${esc(dLabel(lastDayOf(per), { month: "short", day: "numeric" }))}</span><span>${started ? "rest of week" : "projected"}</span></div>
+      <div class="side me"><div class="tn">${esc(tname(S.team))}<small>${games} player-games</small></div><b class="num">${fmt(myWk)}</b><div class="mbar"><i style="width:${(100 * myWk) / Math.max(myWk, oppWk, 1)}%"></i></div></div>
+      <div class="side"><div class="tn">${esc(tname(opp))}<small>${oppGames} player-games</small></div><b class="num">${fmt(oppWk)}</b><div class="mbar"><i style="width:${(100 * oppWk) / Math.max(myWk, oppWk, 1)}%"></i></div></div>
+      <div class="mf">Whoever scores more points this week wins. ${myWk >= oppWk ? `You're projected to win by about <b>${fmt(myWk - oppWk)}</b>.` : `You're projected to lose by about <b>${fmt(oppWk - myWk)}</b>. A pickup whose team plays a lot this week can close it (Pickups → This week).`}</div>
     </div>` : ""}
-    <div class="hero">
-      <div class="stat"><div class="k">Rest of season</div><div class="v">${fmt(mine.v)}</div><div class="s">Rank ${rank} of 12 in the league</div></div>
-      <div class="stat"><div class="k">Roster</div><div class="v">${roster.length}<span style="font-size:16px;color:var(--ink3)"> / ${META.roster.max}</span></div><div class="s">${inj.length ? `${inj.length} hurt` : "Everyone healthy"}</div></div>
-      <div class="stat"><div class="k">Games this week</div><div class="v">${games}</div><div class="s">${opp ? `${esc(tshort(opp))} has ${oppGames}` : "&nbsp;"}</div></div>
-    </div>
-    ${alerts.length ? `<div class="alerts">${alerts.map((a) => `<div class="banner soft">${a}</div>`).join("")}</div>` : ""}
+    ${lineupHTML}
+    <div class="shape"><h3>Where you stand</h3><p class="note">Your rank in the league at each position for the rest of the season (1st is best).</p>${shapeRows}<div class="shp tot"><span>Overall</span><span></span><b>${ordinal(rk.total)}</b></div></div>
     <h3 class="sectitle">This week, night by night</h3>
     <div class="days">${dayRows || '<div class="empty">No games left this week.</div>'}</div>
-    <h3 class="sectitle">Your regular lineup</h3>
-    <p class="note" style="margin:-2px 0 10px">Points are for the rest of the season. Tap a player for the full story.</p>
+    <h3 class="sectitle">Your roster</h3>
+    <p class="note" style="margin:-2px 0 10px">Your usual starters and bench. Points are for the rest of the season. Tap a player for the full story.</p>
     <div class="rink">
       ${grp("C", "Centers")}${grp("W", "Wingers")}${grp("D", "Defense")}${grp("G", "Goalies")}
       <div class="slotgrp"><h3>Bench<small>${lu.bench.length} of ${BENCH}</small></h3>${lu.bench.map((p) => rowMini(p, rosOf(p))).join("")}</div>
     </div>`;
   el.querySelectorAll("[data-tab]").forEach((b) => (b.onclick = () => setTab(b.dataset.tab)));
   el.querySelectorAll("[data-open]").forEach((b) => (b.onclick = () => openPlayer(b.dataset.open)));
+  el.querySelectorAll("[data-scroll]").forEach((b) => (b.onclick = () => { const t = document.getElementById(b.dataset.scroll); if (t) t.scrollIntoView({ behavior: "smooth", block: "start" }); }));
+  const team = S.team;
+  tradeSearch(team).then((deals) => {
+    const li = $("#todoTrade");
+    if (!li || S.team !== team) return;
+    const d = deals[0];
+    li.innerHTML = d ? `<b>Propose a trade to ${esc(tname(d.team))}:</b> give ${d.give.map((p) => esc(p.n)).join(" + ")}, get ${d.get.map((p) => esc(p.n)).join(" + ")}. About ${sgn(d.me)} points for you this season${d.them >= 0 ? `, and it helps them too (${sgn(d.them)})` : ""}. <button class="linkbtn" data-tab="trades">All trade ideas</button>`
+      : `<b>Trades:</b> no deal found that clearly helps both teams right now. <button class="linkbtn" data-tab="trades">Try the trade checker</button>`;
+    li.querySelectorAll("[data-tab]").forEach((b) => (b.onclick = () => setTab(b.dataset.tab)));
+  });
 }
 function rowMini(p, pts, s) {
   const flags = [];
@@ -384,7 +597,7 @@ function renderAdds() {
   const chips = [["ALL", "All"], ["C", "C"], ["W", "W"], ["D", "D"], ["G", "G"]];
   const drops = res.contrib.slice(0, 4);
   el.innerHTML = `
-    <div class="lede"><h2>Pickups</h2><p>Free agents who'd make <b>${esc(tname(S.team))}</b> better, and who to drop for them. Each one is tested in your real lineup, night by night, so games played and position crowding count. The league allows 3 claims a week ($2 a claim, $1 a drop).</p></div>
+    <div class="lede"><h2>Pickups</h2><p>Free agents (players nobody owns) who'd make <b>${esc(tname(S.team))}</b> better, and who to drop for each. Each one is tested in your real lineup night by night, so games and crowded positions count. You get 3 pickups a week ($2 a claim, $1 a drop). Use <b>This week</b> to chase a close matchup.</p></div>
     <div class="controls">
       <div class="chips" role="group" aria-label="Time frame"><button data-mode="ros" aria-pressed="${mode === "ros"}">Rest of season</button><button data-mode="week" aria-pressed="${mode === "week"}">This week${per ? ` (wk ${per.n})` : ""}</button></div>
       <div class="chips" role="group" aria-label="Position">${chips.map(([k, l]) => `<button data-apos="${k}" aria-pressed="${S.addPos === k}">${l}</button>`).join("")}</div>
@@ -423,6 +636,108 @@ function addCard(x, rank, mode) {
     <div class="subrow">${tags.join("")}</div>
     ${open ? detailHTML(p) : ""}
   </div>`;
+}
+
+/* ---------------- trades tab ---------------- */
+function plist(ps) { return ps.map((p) => `<span class="tpl">${face(p, "face sm")}<span><b>${esc(p.n)}</b><small>${esc((p.pos || p.slot).replace(/,/g, "/"))} · ${esc(p.t)}${p.age ? ` · ${p.age}` : ""}</small></span></span>`).join(""); }
+function keeperNotes(give, get) {
+  const n = [];
+  for (const p of give) if (p.age && p.age <= 24 && (p.val ?? 0) > 0) n.push(`${p.n} is ${p.age}: young players are worth more to you next year as keepers.`);
+  for (const p of get) if (p.age && p.age >= 33) n.push(`${p.n} is ${p.age}: good for this season, little keeper value.`);
+  return n;
+}
+function mkLine(d) {
+  const x = d.ratio;
+  if (x == null) return "";
+  if (x >= 1.1) return "By name value (how the experts rank these players) they get more than they give, so it should look good to them.";
+  if (x >= 0.9) return "By name value (how the experts rank these players) it's about even, so it should look fair to them.";
+  return "By name value they give up a little more, so they may ask for a small extra.";
+}
+function dealCard(d, i) {
+  const open = S.tradeOpen === i;
+  let body = "";
+  if (open) {
+    const r = tradeReasons(S.team, d.team, d);
+    const notes = [];
+    if (d.dropMe && d.dropMe.length) notes.push(`You'd need to drop ${d.dropMe.map((p) => esc(p.n)).join(", ")} to make room.`);
+    if (d.addMe) notes.push(`You'd have an open roster spot: pick up ${esc(d.addMe.n)} (${esc(d.addMe.t)}). That's counted in your number.`);
+    if (d.dropThem && d.dropThem.length) notes.push(`They'd have to drop ${d.dropThem.map((p) => esc(p.n)).join(", ")}.`);
+    keeperNotes(d.give, d.get).forEach((t) => notes.push(esc(t)));
+    body = `<div class="dbody">${r.lead ? `<p class="lead">${esc(r.lead)}</p>` : ""}<ul class="why">${r.me.map((t) => `<li class="${/better/.test(t) ? "good" : "bad"}">${esc(t)}</li>`).join("")}${r.them.map((t) => `<li class="info">${esc(t)}</li>`).join("")}${notes.map((t) => `<li class="info">${t}</li>`).join("")}<li class="info">${mkLine(d)}</li></ul>
+      <button class="btn" data-check="${i}">Open in the trade checker</button></div>`;
+  }
+  return `<div class="deal ${d.likely ? "likely" : ""}">
+    <button class="dh" data-deal="${i}" aria-expanded="${open}">
+      <div class="dt"><span>Trade with <b>${esc(tname(d.team))}</b></span><span class="pill ${d.likely ? "good" : "gold"}">${d.likely ? "Likely yes" : "Worth asking"}</span></div>
+      <div class="sides"><div><div class="k">You give</div>${plist(d.give)}</div><div class="arrow">⇄</div><div><div class="k">You get</div>${plist(d.get)}</div></div>
+      <div class="dn"><span>You <b class="gainv">${sgn(d.me)}</b> pts this season</span><span>Them <b class="${d.them >= 0 ? "gainv" : "lossv"}">${sgn(d.them)}</b></span><span class="tog">${open ? "Hide" : "Why?"}</span></div>
+    </button>${body}</div>`;
+}
+function renderTrades() {
+  const el = $("#tab-trades");
+  const teamsOpt = META.teams.filter((t) => t.id !== S.team).sort((a, b) => a.name.localeCompare(b.name));
+  if (!S.ckTeam || S.ckTeam === S.team) S.ckTeam = teamsOpt[0].id;
+  el.innerHTML = `
+    <div class="lede"><h2>Trades</h2><p>Deals that make <b>${esc(tname(S.team))}</b> better for the rest of the season. Each one is tested night by night in both teams' real lineups, so it counts positions, games and who'd sit. <b>Likely yes</b> means it also helps them, by our numbers and by the experts' rankings they probably go by.</p></div>
+    <div id="dealsBox"><div class="empty" id="dealProg">Looking for fair deals across the league…</div></div>
+    <h3 class="sectitle" style="margin-top:22px">Trade checker</h3>
+    <p class="note" style="margin:-2px 0 10px">Got an offer, or have an idea? Pick the team, tap the players on each side, and see who wins.</p>
+    <div class="checker">
+      <select class="sel" id="ckTeam" aria-label="Trade partner">${teamsOpt.map((t) => `<option value="${t.id}" ${t.id === S.ckTeam ? "selected" : ""}>${esc(t.name)}</option>`).join("")}</select>
+      <div class="ckcols"><div><div class="k">You give</div><div id="ckGive" class="cklist"></div></div><div><div class="k">You get</div><div id="ckGet" class="cklist"></div></div></div>
+      <div id="ckOut" class="ckout"></div>
+    </div>`;
+  $("#ckTeam").onchange = (e) => { S.ckTeam = e.target.value; S.ckGive = new Set(); S.ckGet = new Set(); renderChecker(); };
+  renderChecker();
+  const team = S.team;
+  tradeSearch(team, (i, n, T) => { const pg = $("#dealProg"); if (pg) pg.textContent = `Looking for fair deals… checking ${T.name} (${i + 1} of ${n})`; }).then((deals) => {
+    if (S.team !== team || S.tab !== "trades") return;
+    S.deals = deals;
+    const box = $("#dealsBox");
+    box.innerHTML = deals.length ? `<div class="deals">${deals.map(dealCard).join("")}</div>`
+      : `<div class="empty">No trade found that clearly helps both teams right now. Use the checker below to test your own ideas.</div>`;
+    box.onclick = (e) => {
+      const c = e.target.closest("[data-check]");
+      if (c) { const d = S.deals[+c.dataset.check]; S.ckTeam = d.team; S.ckGive = new Set(d.give.map((p) => p.id)); S.ckGet = new Set(d.get.map((p) => p.id)); $("#ckTeam").value = d.team; renderChecker(); $(".checker").scrollIntoView({ behavior: "smooth", block: "start" }); return; }
+      const b = e.target.closest("[data-deal]"); if (!b) return;
+      const i = +b.dataset.deal; S.tradeOpen = S.tradeOpen === i ? null : i;
+      box.innerHTML = `<div class="deals">${S.deals.map(dealCard).join("")}</div>`;
+    };
+  });
+}
+function renderChecker() {
+  S.ckGive = S.ckGive || new Set(); S.ckGet = S.ckGet || new Set();
+  const mine = rosterOf(S.team).sort((a, b) => rosOf(b) - rosOf(a));
+  const theirs = rosterOf(S.ckTeam).sort((a, b) => rosOf(b) - rosOf(a));
+  const item = (p, set, side) => `<button class="ckp ${set.has(p.id) ? "on" : ""}" data-side="${side}" data-id="${esc(p.id)}" aria-pressed="${set.has(p.id)}"><span class="box"></span><span class="nm">${esc(p.n)}<small>${esc((p.pos || p.slot).replace(/,/g, "/"))} · ${esc(p.t)}${hurt(p) ? " · hurt" : ""}</small></span><b class="num">${fmt(rosOf(p))}</b></button>`;
+  $("#ckGive").innerHTML = mine.map((p) => item(p, S.ckGive, "give")).join("");
+  $("#ckGet").innerHTML = theirs.map((p) => item(p, S.ckGet, "get")).join("");
+  $(".ckcols").onclick = (e) => {
+    const b = e.target.closest(".ckp"); if (!b) return;
+    const set = b.dataset.side === "give" ? S.ckGive : S.ckGet;
+    if (set.has(b.dataset.id)) set.delete(b.dataset.id); else set.add(b.dataset.id);
+    renderChecker();
+  };
+  const out = $("#ckOut");
+  const give = mine.filter((p) => S.ckGive.has(p.id)), get = theirs.filter((p) => S.ckGet.has(p.id));
+  if (!give.length && !get.length) { out.innerHTML = `<div class="note">Tap players on both sides. Numbers next to names are points for the rest of the season.</div>`; return; }
+  const v = tradeView(S.team, S.ckTeam, give, get);
+  const d = { team: S.ckTeam, give, get, me: v.me, them: v.them, ratio: v.ratio, a: v.a, b: v.b };
+  const r = tradeReasons(S.team, S.ckTeam, d);
+  let verdict, tone;
+  if (v.me >= 5 && v.them >= 0 && v.ratio >= 0.9) { verdict = "Good for both teams. Worth proposing."; tone = "good"; }
+  else if (v.me >= 5 && v.them >= 0) { verdict = "Good for both lineups, but by name value they give up more, so expect them to ask for a bit extra."; tone = "good"; }
+  else if (v.me >= 5 && v.ratio >= 1) { verdict = "Good for you. It hurts their lineup a bit, but by name value they win, so they might take it."; tone = "good"; }
+  else if (v.me >= 5) { verdict = "Good for you, but it hurts them, so they'll probably say no."; tone = "good"; }
+  else if (v.me > -5) { verdict = "About even for you. Only do it if you like the players you're getting."; tone = ""; }
+  else { verdict = `This makes your team worse by about ${Math.round(-v.me)} points. Pass, unless they add more.`; tone = "bad"; }
+  const notes = [];
+  if (v.a.dropped.length) notes.push(`You'd need to drop ${v.a.dropped.map((p) => esc(p.n)).join(", ")} to stay at ${META.roster.max} players.`);
+  if (v.a.added) notes.push(`You'd have an open spot for ${esc(v.a.added.n)} off waivers (included).`);
+  keeperNotes(give, get).forEach((t) => notes.push(esc(t)));
+  out.innerHTML = `<div class="verdict ${tone}"><b>${verdict}</b>
+    <div class="vn"><span>You <b class="${v.me >= 0 ? "gainv" : "lossv"}">${sgn(v.me)}</b> pts this season</span><span>Them <b class="${v.them >= 0 ? "gainv" : "lossv"}">${sgn(v.them)}</b></span></div>
+    ${r.lead ? `<p class="lead">${esc(r.lead)}</p>` : ""}<ul class="why">${r.me.map((t) => `<li class="${/better/.test(t) ? "good" : "bad"}">${esc(t)}</li>`).join("")}${r.them.map((t) => `<li class="info">${esc(t)}</li>`).join("")}${notes.map((t) => `<li class="info">${t}</li>`).join("")}<li class="info">${mkLine(d)}</li></ul></div>`;
 }
 
 /* ---------------- players tab ---------------- */
@@ -574,9 +889,9 @@ function onListClick(e) {
   if (d.star) { toggleStar(d.star); renderBoardList(); return; }
   if (d.gs) {
     const p = PL.get(d.gs); const cur = gsOf(p);
-    S.gsOv[d.gs] = Math.max(0, Math.min(84, Math.round((cur + Number(d.d)) / 5) * 5)); LS.set("zb-gs", S.gsOv); MEMO.clear(); renderBoardList(); return;
+    S.gsOv[d.gs] = Math.max(0, Math.min(84, Math.round((cur + Number(d.d)) / 5) * 5)); LS.set("zb-gs", S.gsOv); clearCaches(); renderBoardList(); return;
   }
-  if (d.gsreset) { delete S.gsOv[d.gsreset]; LS.set("zb-gs", S.gsOv); MEMO.clear(); renderBoardList(); }
+  if (d.gsreset) { delete S.gsOv[d.gsreset]; LS.set("zb-gs", S.gsOv); clearCaches(); renderBoardList(); }
 }
 
 /* ---------------- league ---------------- */
@@ -621,7 +936,35 @@ function renderHow() {
   const el = $("#tab-how");
   const row = (k, c, w, d) => `<tr><td>${k}</td><td>${c}</td><td>${w}</td><td>${d}</td></tr>`;
   el.innerHTML = `<div class="prose">
-  <div class="lede"><h2>How it works</h2><p>Plain-English notes on where the numbers come from and how much to trust them.</p></div>
+  <div class="lede"><h2>Help</h2><p>Hockey in plain English, then how this site's numbers are made and how much to trust them.</p></div>
+  <h3>Hockey in two minutes</h3>
+  <ul>
+    <li>Each team has six players on the ice: a <b>goalie (G)</b> who stops shots, two <b>defensemen (D)</b> who guard their own net, and three forwards: a <b>center (C)</b> in the middle and two <b>wingers (W)</b> on the sides. Players rotate in short shifts.</li>
+    <li>An NHL team plays about 3 or 4 games a week, 84 games a season. <b>Your players only score on nights their team plays.</b></li>
+  </ul>
+  <h3>Your job in this league</h3>
+  <ol>
+    <li><b>Set your lineup every game day.</b> Fill ${CAP.C} C, ${CAP.W} W, ${CAP.D} D and ${CAP.G} G spots with players who play that night; the ${BENCH} on your bench score nothing. My team works it out for you.</li>
+    <li><b>Win your weekly matchup.</b> Each week (Monday to Sunday) you face one team. Most total points wins.</li>
+    <li><b>Improve the roster.</b> Up to 3 free-agent pickups a week ($2 a claim, $1 a drop), and trades any time. Pickups and Trades show the best moves.</li>
+  </ol>
+  <h3>How players score here</h3>
+  <ul>
+    <li><b>Goals and assists</b> (an assist is a pass that leads to a goal): worth more for wingers and much more for defensemen, 4 points each.</li>
+    <li><b>Faceoff wins</b> (centers only): every stoppage restarts with a puck drop between two centers. A busy center wins 8 to 12 a game, a quarter point each, so they add up.</li>
+    <li><b>Hits and blocked shots</b>: a quarter point each. Tough, physical players pile these up.</li>
+    <li><b>Penalty minutes</b>: half a point a minute. <b>Plus/minus</b>: +1 when you're on the ice for a goal by your team, −1 for one against.</li>
+    <li><b>Goalies</b>: 3 for a win, a quarter point per save, −1 per goal allowed, 4 for a shutout. Only the goalie who starts gets anything, which is why starts matter so much.</li>
+  </ul>
+  <p><b>What wins here:</b> defensemen who score, centers who take lots of faceoffs, physical players who hit and block, and goalies who start most nights.</p>
+  <h3>Words you'll see</h3>
+  <ul>
+    <li><b>Power play (PP1, PP2):</b> when the other team has a player in the penalty box. The top unit (PP1) gets the best scoring chances.</li>
+    <li><b>Top line / 3rd line:</b> forwards play in groups of three. The top line plays the most and scores the most.</li>
+    <li><b>Starter vs backup goalie:</b> starters play roughly 55 to 65 games; backups play the rest.</li>
+    <li><b>IR (injured reserve):</b> 4 extra roster spots for injured players that don't count toward your 18.</li>
+    <li><b>Keepers:</b> this league lets each team keep 7 players for next season, so young players are worth a little extra to you.</li>
+  </ul>
   <h3>This league's scoring</h3>
   <p>Head-to-head points, one matchup a week. ${META.firstPlayoff - 1} regular-season weeks, then ${META.playoffTeams} teams make the playoffs (the last round runs two weeks). Lineups: ${CAP.C} centers, ${CAP.W} wingers, ${CAP.D} defensemen, ${CAP.G} goalies, and ${BENCH} bench spots, set every day.</p>
   <div class="tablewrap"><table><thead><tr><th>Skater stat</th><th>Center</th><th>Wing</th><th>Defense</th></tr></thead><tbody>
@@ -666,11 +1009,13 @@ function renderHow() {
   <h3>The 84-game season and injuries</h3>
   <p>The NHL plays 84 games this season, but Fantrax's last week ends ${esc(dLabel(SEASON_END, { month: "long", day: "numeric" }))}, so each team has 80 to 82 games that count here. Every projection uses the real schedule. Players known to be hurt as of ${esc(META.newsAsOf)} lose the games their team plays before their expected return, and a hurt goalie's starts go to his teammates. Camp news on each card (lines, power-play units, new teams) comes from beat writers and fantasy analysts, with the source named.</p>
 
-  <h3>My team and pickups</h3>
+  <h3>My team, trades and pickups</h3>
   <ul>
     <li><b>Night by night.</b> Every night, your best lineup is picked from the players who have a game, respecting ${CAP.C} C, ${CAP.W} W, ${CAP.D} D and ${CAP.G} G. On busy nights some good players sit; on quiet nights slots stay empty. That's why games played and roster balance matter as much as raw points.</li>
     <li><b>The matchup</b> is the same calculation for both teams over this week's schedule. Goalies are counted at their chance of starting, so it assumes you don't know the starter in advance.</li>
     <li><b>Pickups</b> test every good free agent in your real lineup against your easiest drops, over the rest of the season or just this week. "Easiest to drop" means the player whose removal costs your lineup the fewest points.</li>
+    <li><b>Trades</b> are found by trying every one-for-one, two-for-one and one-for-two swap with each team, then replaying the rest of the season night by night for both rosters (a team that ends up a player short picks up its best free agent; a team with one too many drops its least useful player). A deal is shown only if it helps you and doesn't look lopsided to them. "Name value" is how the other manager will probably see it: the experts' view of each player, with stars worth more than two lesser players added together (value above waiver level to the power 1.5), because nobody trades a star for two fillers.</li>
+    <li><b>Where you stand</b> ranks each position by the points your starters there are projected to score the rest of the season.</li>
     <li><b>Rosters update from Fantrax</b> every few minutes while the page is open, so pickups and drops anywhere in the league show up on their own.</li>
   </ul>
 
@@ -706,6 +1051,7 @@ function setTab(t) {
 }
 function renderTab() {
   if (S.tab === "team") renderTeam();
+  else if (S.tab === "trades") renderTrades();
   else if (S.tab === "adds") renderAdds();
   else if (S.tab === "board") renderBoard();
   else if (S.tab === "league") renderLeague();
@@ -764,7 +1110,6 @@ function afterSync() {
   if (sig !== S.lastSig) {
     const first = !S.lastSig;
     S.lastSig = sig;
-    MEMO.clear();
     const ae = document.activeElement;
     if (!(ae && ae.id === "q") || first) renderTab(); else renderBoardList();
   }
@@ -793,14 +1138,14 @@ function init() {
   const sel = $("#teamSel");
   sel.innerHTML = META.teams.slice().sort((a, b) => a.name.localeCompare(b.name)).map((t) => `<option value="${t.id}">${esc(t.name)}</option>`).join("");
   sel.value = S.team;
-  sel.onchange = () => { S.team = sel.value; LS.set("zb-team", S.team); S.lastSig = ""; S.addOpen = null; MEMO.clear(); renderAll(); };
+  sel.onchange = () => { S.team = sel.value; LS.set("zb-team", S.team); S.lastSig = ""; S.addOpen = null; clearCaches(); renderAll(); };
   document.querySelectorAll("nav.tabs button").forEach((b) => (b.onclick = () => setTab(b.dataset.tab)));
   $("#subline").textContent = `${META.season} · projections ${new Date(META.built).toLocaleDateString([], { month: "short", day: "numeric" })} · news ${dLabel(META.newsAsOf, { month: "short", day: "numeric" })}`;
   $("#foot").innerHTML = `Stats and schedule from the NHL. League and rosters from Fantrax (read-only). Analyst rankings from ${META.experts.n} public sources, blended; no lists are reproduced here. Not affiliated with the NHL or Fantrax. <button class="btn" id="resetBtn" style="margin-left:6px;padding:4px 10px;font-size:12.5px">Clear my stars and goalie starts</button>`;
   $("#resetBtn").onclick = () => {
     if (!confirmReset()) return;
     S.stars = {}; S.gsOv = {}; LS.set("zb-stars", {}); LS.set("zb-gs", {});
-    MEMO.clear(); S.lastSig = ""; renderAll(); toast("Cleared stars and goalie starts");
+    clearCaches(); S.lastSig = ""; renderAll(); toast("Cleared stars and goalie starts");
   };
   boardShell();
   const hash = location.hash.replace("#", "");

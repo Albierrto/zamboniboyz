@@ -340,6 +340,82 @@ button.slot{width:100%;background:none;border:0;border-top:1px solid var(--line)
 .mup b{font-family:var(--font-m);font-weight:500}
 @media (max-width:720px){ #tab-team .hero{grid-template-columns:repeat(3,minmax(0,1fr));gap:8px} #tab-team .hero .stat{padding:10px} #tab-team .hero .v{font-size:24px} #tab-team .hero .s{font-size:12px} .days{grid-template-columns:1fr 1fr} .day{grid-template-columns:1fr;gap:4px} .day .dd{flex-direction:row;gap:6px;align-items:baseline} }
 
+/* ---------- home: to-do, tonight, shape ---------- */
+.todo{background:var(--panel);border:1px solid color-mix(in srgb,var(--ice) 45%,var(--line));border-radius:16px;padding:12px 14px 6px;margin:0 0 14px}
+.todo h3,.shape h3{margin:0 0 6px;font-family:var(--font-d);font-size:16px;letter-spacing:.06em;text-transform:uppercase}
+.todo ol{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:8px}
+.todo li{font-size:14.5px;color:var(--ink2);padding-bottom:8px;border-bottom:1px solid var(--line)}
+.todo li:last-child{border-bottom:0}
+.todo li b{color:var(--ink)}
+.tonight{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:12px 14px;margin:0 0 14px;scroll-margin-top:150px}
+.tonight .th2{display:flex;justify-content:space-between;align-items:flex-end;gap:10px}
+.tonight .k{font-size:11.5px;color:var(--ink3);text-transform:uppercase;letter-spacing:.06em}
+.tonight .d{font-family:var(--font-d);font-size:21px;font-weight:600;letter-spacing:.02em;text-transform:uppercase;line-height:1.15}
+.tonight .tp{text-align:right}
+.tonight .tp b{display:block;font-family:var(--font-d);font-size:24px;font-weight:600;line-height:1}
+.tonight .tp small{font-size:10.5px;color:var(--ink3);text-transform:uppercase;letter-spacing:.06em}
+.tonight .note{margin:6px 0 10px}
+.lgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px}
+.lgrp{border:1px solid var(--line);border-radius:12px;padding:6px 10px;background:color-mix(in srgb,var(--panel2) 40%,var(--panel))}
+.lh{font-family:var(--font-d);font-size:13px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink3);display:flex;justify-content:space-between;padding:2px 0 4px}
+.lh small{font-family:var(--font-b);letter-spacing:0;text-transform:none}
+.lp{display:grid;grid-template-columns:30px minmax(0,1fr) auto;gap:8px;align-items:center;padding:5px 0;border-top:1px solid var(--line);width:100%;background:none;border-left:0;border-right:0;border-bottom:0;text-align:left;cursor:pointer;font:inherit;color:inherit}
+.lh + .lp{border-top:0}
+.lp .face{width:30px;height:30px}
+.lp span{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lp span small{display:block;font-weight:500;font-size:11.5px;color:var(--gold)}
+.lp.empty{grid-template-columns:1fr;cursor:default}
+.lp.empty span{color:var(--ink3);font-weight:500;font-size:13px}
+.benchline{margin-top:10px;font-size:13.5px;color:var(--ink2);display:flex;flex-direction:column;gap:4px}
+.benchline b{color:var(--ink)}
+.shape{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:12px 14px;margin:0 0 18px;max-width:560px}
+.shape .note{margin:0 0 8px}
+.shp{display:grid;grid-template-columns:96px minmax(0,1fr) 44px;gap:10px;align-items:center;font-size:14px;padding:4px 0}
+.shp .t{height:9px;border-radius:9px;background:var(--panel3);overflow:hidden}
+.shp .t i{display:block;height:100%;background:var(--ink3);border-radius:9px}
+.shp .t i.good{background:var(--good)} .shp .t i.bad{background:var(--bad)}
+.shp b{text-align:right;font-family:var(--font-d);font-size:17px;font-weight:600}
+.shp b.good{color:var(--good)} .shp b.bad{color:var(--bad)}
+.shp.tot{border-top:1px solid var(--line);margin-top:4px;padding-top:8px;font-weight:700}
+/* ---------- trades ---------- */
+.deals{display:flex;flex-direction:column;gap:10px}
+.deal{background:var(--panel);border:1px solid var(--line);border-radius:16px;overflow:hidden}
+.deal.likely{border-color:color-mix(in srgb,var(--good) 55%,var(--line))}
+.dh{width:100%;background:none;border:0;text-align:left;cursor:pointer;padding:12px 14px;display:flex;flex-direction:column;gap:10px;font:inherit;color:inherit}
+.dt{display:flex;justify-content:space-between;gap:10px;align-items:center;font-size:14px;color:var(--ink2)}
+.dt b{color:var(--ink)}
+.sides{display:grid;grid-template-columns:minmax(0,1fr) 22px minmax(0,1fr);gap:8px;align-items:start}
+.sides .k,.ckcols .k{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--ink3);margin-bottom:4px}
+.sides .arrow{font-size:18px;color:var(--ink3);text-align:center;padding-top:22px}
+.tpl{display:flex;gap:8px;align-items:center;margin-bottom:6px;min-width:0}
+.tpl>span{min-width:0}
+.tpl b{display:block;font-size:14.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tpl small{display:block;font-size:12px;color:var(--ink3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.face.sm{width:32px;height:32px;flex:0 0 auto}
+.dn{display:flex;gap:14px;align-items:center;font-size:13.5px;color:var(--ink2);flex-wrap:wrap}
+.dn b{font-family:var(--font-d);font-size:19px;font-weight:600;margin:0 2px}
+.dn .tog{margin-left:auto;color:var(--ice);font-weight:700}
+.dbody .lead{margin:0;font-size:14.5px;color:var(--ink);font-weight:600}
+.verdict .lead{margin:0;font-size:14px;color:var(--ink2)}
+.gainv{color:var(--good)} .lossv{color:var(--bad)}
+.dbody{border-top:1px solid var(--line);padding:10px 14px 12px;display:flex;flex-direction:column;gap:10px;align-items:flex-start}
+.checker{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:12px 14px;display:flex;flex-direction:column;gap:10px}
+.checker .sel{align-self:flex-start;max-width:100%}
+.ckcols{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.cklist{display:flex;flex-direction:column;gap:4px;max-height:360px;overflow-y:auto;-webkit-overflow-scrolling:touch}
+.ckp{display:grid;grid-template-columns:18px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 8px;border:1px solid var(--line);border-radius:10px;background:var(--panel2);cursor:pointer;text-align:left;font:inherit;color:inherit;min-height:44px}
+.ckp .box{width:16px;height:16px;border-radius:4px;border:2px solid var(--ink3)}
+.ckp.on{border-color:var(--ice);background:color-mix(in srgb,var(--ice) 14%,var(--panel2))}
+.ckp.on .box{background:var(--ice);border-color:var(--ice)}
+.ckp .nm{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ckp .nm small{display:block;font-weight:500;font-size:11.5px;color:var(--ink3)}
+.ckp b{font-size:13px;color:var(--ink2)}
+.verdict{border-left:4px solid var(--ink3);background:var(--panel2);border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:8px;font-size:14.5px}
+.verdict.good{border-left-color:var(--good)} .verdict.bad{border-left-color:var(--bad)}
+.vn{display:flex;gap:14px;font-size:13.5px;color:var(--ink2)}
+.vn b{font-family:var(--font-d);font-size:19px;font-weight:600}
+@media (max-width:720px){ .ckcols{grid-template-columns:1fr} .cklist{max-height:260px} .sides{grid-template-columns:1fr;gap:2px} .sides .arrow{padding:0;text-align:left;transform:rotate(90deg);width:18px} .lgrid{grid-template-columns:1fr} }
+
 @media (max-width:720px){
   .suggest{grid-template-columns:none;grid-auto-flow:column;grid-auto-columns:86%;overflow-x:auto;scroll-snap-type:x mandatory;padding-bottom:4px;scrollbar-width:none;margin-right:-16px;padding-right:16px}
   .suggest::-webkit-scrollbar{display:none}
@@ -374,16 +450,18 @@ button.slot{width:100%;background:none;border:0;border-top:1px solid var(--line)
   </div>
   <nav class="tabs" role="tablist">
     <button role="tab" data-tab="team" aria-selected="true">My team</button>
+    <button role="tab" data-tab="trades">Trades</button>
     <button role="tab" data-tab="adds">Pickups</button>
     <button role="tab" data-tab="board">Players</button>
     <button role="tab" data-tab="league">League</button>
-    <button role="tab" data-tab="how">How it works</button>
+    <button role="tab" data-tab="how">Help</button>
   </nav>
   <div id="clockWrap"><div class="clock" id="clock"></div></div>
 </header>
 
 <main>
   <section id="tab-team"></section>
+  <section id="tab-trades" hidden></section>
   <section id="tab-adds" hidden></section>
   <section id="tab-board" hidden></section>
   <section id="tab-league" hidden></section>
@@ -393,6 +471,6 @@ button.slot{width:100%;background:none;border:0;border-top:1px solid var(--line)
 <div class="toast" id="toast" hidden><span id="toastMsg"></span><button id="toastBtn">Undo</button></div>
 
 <script src="data/board.js?v=20260924a"></script>
-<script src="app.js?v=20260924b"></script>
+<script src="app.js?v=20260924c"></script>
 </body>
 </html>
