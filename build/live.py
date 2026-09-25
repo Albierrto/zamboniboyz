@@ -8,6 +8,11 @@ How much the early numbers count was tuned on five past seasons (build/inseason_
 build/inseason_goalies.py): each stat's projection is worth K games of evidence, so fast-settling
 stats (faceoffs, hits) move quickly and goals barely move early. Ice-time and power-play-time changes
 add a little on top. Goalies: starts share and points per start update the same way.
+
+Injuries: every run (before the season too) it reads ESPN's public NHL injury report and writes each
+listed player's status, expected return date and body part into live.json ("inj"). Only those facts
+are kept, never the report's write-ups. Players from the preseason news list who have since played
+a game are listed in "back" so the site stops treating them as hurt.
 """
 import datetime as dt
 import json
@@ -35,17 +40,19 @@ KG = {"share": 23.2, "pps": 53.6}
 SK = {"C": {"g": 3.0, "a": 2.0, "fow": 0.25}, "W": {"g": 3.5, "a": 2.5, "fow": 0.0}, "D": {"g": 4.0, "a": 4.0, "fow": 0.25}}
 COM = {"pm": 1.0, "pim": 0.5, "hit": 0.25, "blk": 0.25}
 CATS = ["g", "a", "pm", "pim", "hit", "blk", "fow"]
+INJ_URL = os.environ.get("LIVE_INJ_URL", "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/injuries")
+ESPN_TEAM = {"LA": "LAK", "NJ": "NJD", "SJ": "SJS", "TB": "TBL", "UTAH": "UTA"}
 
 
 def w(slot, c):
     return SK[slot].get(c, COM.get(c, 0.0))
 
 
-def get(url, tries=6):
+def get(url, tries=6, ua="zamboniboyz-refresh/1.0"):
     last = None
     for a in range(tries):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "zamboniboyz-refresh/1.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": ua} if ua else {})
             with urllib.request.urlopen(req, timeout=60) as r:
                 return json.loads(r.read().decode("utf-8"))
         except Exception as e:  # rate limits and hiccups: back off
@@ -70,6 +77,51 @@ def norm(s):
     return re.sub(r"\s+", " ", re.sub(r"[^a-z ]", "", s.replace("-", " ").replace(".", " "))).strip()
 
 
+def injuries(players, today, old):
+    """Injury report -> {board id: {s, ret, why, d}}. s: out, dtd, ir, ltir or susp.
+    ret is the first day he can play. When the report's date has passed but he's still listed,
+    we assume he's out through today. On a failed pull the last good list is kept."""
+    try:
+        d = get(INJ_URL, tries=3, ua=None)  # this feed turns away custom user agents
+    except Exception as e:
+        print("injury report unavailable, keeping the last one:", e, file=sys.stderr)
+        return old.get("inj") or {}, old.get("injAt")
+    by = {}
+    for p in players:
+        by.setdefault(norm(p["n"]), []).append(p)
+    tomorrow = (today + dt.timedelta(days=1)).isoformat()
+    out = {}
+    for team in d.get("injuries", []):
+        for it in team.get("injuries", []):
+            a = it.get("athlete") or {}
+            cands = by.get(norm(a.get("displayName", "")), [])
+            ab = (a.get("team") or {}).get("abbreviation", "")
+            ab = ESPN_TEAM.get(ab, ab)
+            if len(cands) > 1:
+                cands = [p for p in cands if p.get("t") == ab]
+            if len(cands) != 1:
+                continue
+            p = cands[0]
+            det = it.get("details") or {}
+            fs = ((det.get("fantasyStatus") or {}).get("abbreviation") or "").upper()
+            st = (it.get("status") or "").lower()
+            kind = "susp" if ("suspens" in st or det.get("type") == "Suspension") else "dtd" if "day" in st else \
+                "ltir" if fs == "IR-LT" else "ir" if (fs.startswith("IR") or "reserve" in st) else "out"
+            rep = (it.get("date") or "")[:10] or today.isoformat()
+            ret = (det.get("returnDate") or "")[:10] or None
+            try:
+                r0 = dt.date.fromisoformat(rep)
+                if kind == "ir": ret = max(ret or "", (r0 + dt.timedelta(days=7)).isoformat())
+                if kind == "ltir": ret = max(ret or "", (r0 + dt.timedelta(days=24)).isoformat())
+            except ValueError:
+                pass
+            if kind != "dtd" and (not ret or ret <= today.isoformat()):
+                ret = tomorrow
+            why = det.get("type") or ""
+            out[p["id"]] = {"s": kind, "ret": ret, "why": "" if why == "Suspension" else why, "d": rep}
+    return out, dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
 def main():
     raw = open(BOARD, encoding="utf-8").read()
     B = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
@@ -77,6 +129,12 @@ def main():
     now = dt.datetime.now(dt.timezone.utc)
     today = dt.date.fromisoformat(os.environ["LIVE_TODAY"]) if os.environ.get("LIVE_TODAY") else now.astimezone(ET).date()
     out = {"generated": now.isoformat(timespec="seconds"), "season": SEASON, "players": {}, "started": False}
+    try:
+        old = json.load(open(OUT, encoding="utf-8"))
+    except Exception:
+        old = {}
+    out["inj"], out["injAt"] = injuries(players, today, old)
+    print(f"injuries: {len(out['inj'])} board players listed")
     start = dt.date.fromisoformat(meta["sched"]["days"][0][0])
     if today <= start:
         out["note"] = "Season hasn't started; nothing to update yet."
@@ -168,6 +226,9 @@ def main():
         if tg10.get(team, 0) >= 3 and gp10 == 0:
             rec["out"] = tg10.get(team, 0)
         out["players"][p["id"]] = rec
+        # on the preseason injury list but he has played since, and he's not on the report now: he's back
+        if p.get("ret") and rec.get("n") and p["id"] not in out["inj"]:
+            out.setdefault("back", []).append(p["id"])
     out["asOf"] = y
     json.dump(out, open(OUT, "w"), separators=(",", ":"))
     print(f"live: {len(out['players'])} players updated through {y}")
