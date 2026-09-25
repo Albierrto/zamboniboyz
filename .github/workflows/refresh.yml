@@ -1,7 +1,8 @@
 name: refresh
-# Pulls this season's NHL stats and rewrites docs/data/live.json (in-season projection updates,
-# breakout chances, "not playing lately" flags). GitHub delays or drops some scheduled runs,
-# so it runs every 3 hours at an off-peak minute; a missed slot is covered by the next one.
+# Pulls the injury report and this season's NHL stats and rewrites docs/data/live.json (injuries,
+# in-season projection updates, breakout chances, "not playing lately" flags). GitHub delays or drops
+# some scheduled runs, so it runs at an off-peak minute: every 3 hours overnight and about hourly
+# from late morning to evening Eastern, when injury news and game-day scratches come out.
 on:
   schedule:
     - cron: "23 1 * * *"
@@ -9,9 +10,15 @@ on:
     - cron: "23 7 * * *"
     - cron: "23 10 * * *"
     - cron: "23 13 * * *"
+    - cron: "23 15 * * *"
     - cron: "23 16 * * *"
+    - cron: "23 17 * * *"
+    - cron: "23 18 * * *"
     - cron: "23 19 * * *"
+    - cron: "23 20 * * *"
+    - cron: "23 21 * * *"
     - cron: "23 22 * * *"
+    - cron: "23 23 * * *"
   workflow_dispatch:
 permissions:
   contents: write
@@ -27,7 +34,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Pull season stats and update projections
+      - name: Pull injuries and season stats, update projections
         run: python build/live.py
       - name: Commit live.json
         run: |
