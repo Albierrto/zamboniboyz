@@ -367,6 +367,10 @@ meta["breakout"] = dict(uplift=BO["uplift"], base=BO["base"], chg=7.06,
 meta["live"] = dict(raw="https://raw.githubusercontent.com/Albierrto/zamboniboyz/main/docs/data/live.json", local="data/live.json")
 meta["adpNote"] = "Fantrax average draft position across all Fantrax NHL drafts, as of " + datetime.date.today().isoformat()
 import os; os.makedirs("site/data", exist_ok=True)
+# keeper-league facts for the trade tools (next-season aging, pick values, league rules)
+sys.path.insert(0, "build")
+import keepers_meta as KM
+meta.update(KM.build(players))
 with open("site/data/board.js", "w") as f:
     f.write("window.BOARD=" + json.dumps(dict(meta=meta, players=players), separators=(",", ":"), ensure_ascii=False) + ";\n")
 print("board.js bytes:", os.path.getsize("site/data/board.js"))
