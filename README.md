@@ -40,5 +40,13 @@ Injuries (every run, preseason included): ESPN's public NHL injury report (`site
 
 How fast early numbers count was tuned on 2021-22..2025-26 (`build/fetch_splits.py`, `build/inseason_lab.py`, `build/inseason_goalies.py`): each stat's projection is worth K games of evidence (goals 82, assists 70, +/- 106, PIM 134, hits 18, blocks 35, faceoff wins 8), plus +0.043 points a game per extra minute of ice time and +0.033 per extra power-play minute. Goalies: starts share K = 23 team games, points per start K = 54 starts.
 
+## Trades (keeper league)
+- League rules that drive it (rulebook + Fantrax settings): keep exactly 7 (1 C, 2 W, 2 D, 1 G, 1 more skater); 11-round draft, worst to best every round (no snake), round-1 lottery among the 5 non-playoff teams (30/25/20/15/10); 2027 picks tradeable (`getDraftPicks`); no adds in the playoffs; trade deadline Feb 23.
+- Next-season value: points per team game x 82 x an age factor minus waiver level. `build/keeperlab.py` measured the factor on 2014-15..2024-25 (players with 20+ games the year before, next-year totals incl. zeros): quadratic in age for skaters (+4% at 21, -2% at 27, -8% at 30, -17% at 33), goalie bands (-11% at 26-31). Leave-one-season-out: MAE 68.7 -> 66.3, rank correlation 0.56 -> 0.63.
+- Pick values: this year's draft, each pick's projected points above waiver level, fitted v(n) = A e^(-bn) + c (`build/keepers_meta.py`, into `meta.pickCurve`). Each 2027 pick is valued at its likely slot from 4,000 simulated final standings with the lottery; a team counts only its best 11 picks.
+- A trade's value to a team = change in this season's night-by-night lineup points + w x (change in its best keeper group + change in its picks), w = 0.15 / 0.5 / 1 for This season / Both / Next season. Every team is first given up to three free-agent swaps it could make anyway (`effAll`), so trades only get credit for what waivers can't give.
+- Name-value check is one way: the other team must get at least 80% of what it sends (experts' value above waiver level for the rest of this season plus half of next, to the power 1.5; picks at half their value).
+- Deal desk: sell (who needs him, best packages from every team), buy (packages from your roster they'd take), analyze (ledger: this season / keepers / picks), to even it, market gaps.
+
 ## Breakouts
 `build/breakoutlab.py` / `build/breakout.py`: chance a skater projected below waiver level finishes at or above it (logistic model on 9 seasons, leave-one-season-out AUC 0.82 vs 0.81 for projection alone; top 30 a season broke out 50% vs a 15% base rate), re-weighted with the analysts' view (tested on 4 seasons). In season the odds move with the projection: logit(p) += 7.06 x ln(multiplier) x n/(n+5).
