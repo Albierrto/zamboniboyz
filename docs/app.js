@@ -314,14 +314,52 @@ function nightTotal(on, day) {
   if (v === undefined) { v = nightLineup(on, false, day).total; if (NL.size > 400000) NL.clear(); NL.set(k, v); }
   return v;
 }
+// Roster limits, night by night. A team carries 18 players plus 4 IR spots, and only injured or suspended players
+// can sit on IR. So on any day, the healthy players who count are the team's best (18 minus any injured players
+// beyond the 4 IR spots); the rest would have to be cut. That stops a team with 23 names from getting credit for
+// all of them when its injured players come back.
+const CAPX = { off: false };
+function keepVal(p) { const s = elig(p)[0]; return bestRate(p) - (REPL[s] || 0) / 82; }
+function rosterOrder(roster) {
+  return roster.map((p) => [p, keepVal(p)]).sort((a, b) => b[1] - a[1] || (a[0].id < b[0].id ? -1 : 1)).map((x) => x[0]);
+}
+function activeOn(R, day) {
+  const cap = META.roster.max, irs = (META.rules && META.rules.irSlots) || 4, on = [];
+  if (CAPX.off) { for (const p of R) if (plays(p, day)) on.push(p); return on; }
+  let hurtN = 0;
+  for (const p of R) if (p.ret && day.d < p.ret) hurtN++;
+  const room = cap - Math.max(0, hurtN - irs);
+  let n = 0;
+  for (const p of R) {
+    if (p.ret && day.d < p.ret) continue;        // hurt: sits on IR (or takes a spot, counted above) and can't play
+    if (++n > room) break;                       // over the limit: the team would have cut him
+    if (p.t && day.teams.has(p.t)) on.push(p);
+  }
+  return on;
+}
 function rangeValue(roster, days) {
   let v = 0;
-  const R = roster.slice().sort((a, b) => (a.id < b.id ? -1 : 1));
+  const R = rosterOrder(roster);
   for (const day of days) {
-    const on = R.filter((p) => plays(p, day));
+    const on = activeOn(R, day);
     if (on.length) v += nightTotal(on, day);
   }
   return v;
+}
+// how many nights each player would actually be in the lineup, and the points he'd score in them
+function lineupStarts(list, days) {
+  return memo("starts|" + list.map((p) => p.id).sort().join(",") + "|" + days.length + "|" + (days[0] ? days[0].d : ""), () => {
+    const out = new Map(), R = rosterOrder(list);
+    for (const p of list) out.set(p.id, { n: 0, pts: 0, games: 0, cut: 0, by: {} });
+    for (const day of days) {
+      const on = activeOn(R, day);
+      for (const p of list) if (plays(p, day)) { const o = out.get(p.id); o.games++; if (!on.includes(p)) o.cut++; }
+      if (!on.length) continue;
+      const nl = nightLineup(on, true, day);
+      for (const p of on) { const sl = nl.start.get(p.id); if (sl) { const o = out.get(p.id); o.n++; o.pts += rateOn(p, sl, day); o.by[sl] = (o.by[sl] || 0) + 1; } }
+    }
+    return out;
+  });
 }
 // season-shape lineup (who your regular starters are), by rest-of-season points
 function fillLineup(list) {
@@ -428,8 +466,9 @@ function pickups(team, mode) {
 const SLOTS = ["C", "W", "D", "G"];
 function shapeOf(list, days) {
   const out = { C: 0, W: 0, D: 0, G: 0, total: 0 };
+  const R = rosterOrder(list);
   for (const day of days) {
-    const on = list.filter((p) => plays(p, day));
+    const on = activeOn(R, day);
     if (!on.length) continue;
     const nl = nightLineup(on, true, day);
     for (const p of on) { const s = nl.start.get(p.id); if (s) { const r = rateOn(p, s, day); out[s] += r; out.total += r; } }
@@ -906,7 +945,8 @@ function renderTeam() {
       ${empty.length && on.length ? `<div class="gap">Empty spots: ${empty.join(", ")}</div>` : ""}${!on.length ? `<div class="gap">Nobody plays</div>` : ""}</div></div>`;
   }).join("");
 
-  const slotRow = (x, s) => rowMini(x.p, rosAt(x.p, s), s);
+  const ST = lineupStarts(roster, rosDays());
+  const slotRow = (x, s) => rowMini(x.p, rosAt(x.p, s), s, ST.get(x.p.id));
   const grp = (s, label) => `<div class="slotgrp"><h3>${label}<small>${lu.slots[s].length} of ${CAP[s]}</small></h3>${lu.slots[s].map((x) => slotRow(x, s)).join("")}${Array.from({ length: Math.max(0, lu.needs[s]) }, () => `<div class="slot open"><div class="open-ic"></div><div class="nm">Open spot<small>check Pickups</small></div><b></b></div>`).join("")}</div>`;
   const summary = `Projected <b>${ordinal(rk.total)} of 12</b> for the season.${weak.length ? ` Weakest spot: <b>${word[weak[0]]}</b> (${ordinal(rk[weak[0]])} in the league)${weak[1] ? `, then ${word[weak[1]]} (${ordinal(rk[weak[1]])})` : ""}.` : ""}${strong.length ? ` You're strong at ${strong.map((s) => word[s]).join(" and ")}.` : ""} The list below is how to climb.`;
   el.innerHTML = `
@@ -923,10 +963,10 @@ function renderTeam() {
     <h3 class="sectitle">This week, night by night</h3>
     <div class="days">${dayRows || '<div class="empty">No games left this week.</div>'}</div>
     <h3 class="sectitle">Your roster</h3>
-    <p class="note" style="margin:-2px 0 10px">Your usual starters and bench. Points are for the rest of the season. Tap a player for the full story.</p>
+    <p class="note" style="margin:-2px 0 10px">Your usual starters and bench. Points are what each player should score for you the rest of the season, counting only the nights he'd actually be in your lineup (a bench player on a busy night scores nothing). Tap a player for the full story.</p>
     <div class="rink">
       ${grp("C", "Centers")}${grp("W", "Wingers")}${grp("D", "Defense")}${grp("G", "Goalies")}
-      <div class="slotgrp"><h3>Bench<small>${lu.bench.length} of ${BENCH}</small></h3>${lu.bench.map((p) => rowMini(p, rosOf(p))).join("")}</div>
+      <div class="slotgrp"><h3>Bench<small>${lu.bench.length} of ${BENCH}</small></h3>${lu.bench.map((p) => rowMini(p, rosOf(p), null, ST.get(p.id))).join("")}</div>
     </div>`;
   el.querySelectorAll("[data-tab]").forEach((b) => (b.onclick = () => setTab(b.dataset.tab)));
   el.querySelectorAll("[data-open]").forEach((b) => (b.onclick = () => openPlayer(b.dataset.open)));
@@ -943,10 +983,16 @@ function renderTeam() {
     li.querySelectorAll("[data-tab]").forEach((b) => (b.onclick = () => setTab(b.dataset.tab)));
   });
 }
-function rowMini(p, pts, s) {
+function startsText(st, p) {
+  if (!st || !st.games) return "";
+  if (st.cut >= st.games * 0.9) return p && hurt(p) ? "you'll be over the roster limit when he's back, and he'd be the one to cut" : "would be cut once your injured players return";
+  return `in the lineup ${st.n} of ${st.games} games`;
+}
+function rowMini(p, pts, s, st) {
   const flags = [];
   { const it = injTag(p, true); if (it) flags.push(it); }
-  return `<button class="slot" data-open="${esc(p.id)}">${face(p)}<div class="nm">${esc(p.n)}<small>${s && s !== p.slot ? `as ${s} · ` : ""}${esc(p.t)}</small> ${flags.join(" ")}</div><b class="num">${fmt(pts)}</b></button>`;
+  const sub = [s && s !== p.slot ? `as ${s}` : "", esc(p.t), st ? startsText(st, p) : ""].filter(Boolean).join(" · ");
+  return `<button class="slot" data-open="${esc(p.id)}">${face(p)}<div class="nm">${esc(p.n)}<small>${sub}</small> ${flags.join(" ")}</div><b class="num">${fmt(st ? st.pts : pts)}</b></button>`;
 }
 function openPlayer(id) {
   S.open = id; S.q = player(id).n; S.pos = "ALL"; S.faOnly = false;
@@ -1583,6 +1629,10 @@ function detailHTML(p) {
   if (lv && lv.n) lead += `<li class="info">This season so far: ${lv.n} game${lv.n === 1 ? "" : "s"}, ${fmt(lv.fp)} fantasy points${lv.toi ? `, ${fmt(lv.toi, 1)} min a game` : ""}${lv.pp ? ` (${fmt(lv.pp, 1)} on the power play)` : ""}. His projection has moved ${sgn(100 * ((liveMult(p) || 1) - 1))}% since the season started.</li>`;
   const ij = injOf(p);
   if (hurt(p) || dtd(p)) lead = `<li class="bad">${esc(injWhat(p))}${hurt(p) && !(dtd(p) && !missedGames(p)) ? `: expected back around <b>${esc(dLabel(p.ret, { month: "short", day: "numeric" }))}</b>${missedGames(p) ? `, so he misses about ${missedGames(p)} of his team's games` : ""}` : ": he might miss a game"}.${ij ? ` From ESPN's NHL injury report (${esc(dLabel(ij.d, { month: "short", day: "numeric" }))}), checked several times a day; every projection on this site already counts it.` : ""}</li>` + lead;
+  if (!p.unknown && p.gm > 0 && owners()[p.id]) {
+    const ow = owners()[p.id], st = lineupStarts(rosterOf(ow), rosDays()).get(p.id);
+    if (st && st.games) lead += `<li class="info">${st.cut >= st.games * 0.9 ? `${esc(tname(ow))} is over the roster limit once its injured players return, so he'd likely be cut.` : `In ${ow === S.team ? "your" : esc(tname(ow)) + "'s"} lineup about <b>${st.n}</b> of his ${st.games} remaining games (${Math.round(st.pts)} points); the other nights he'd sit behind better players at his position.`}</li>`;
+  }
   if (!p.unknown && p.gm > 0) {
     const nv = nextVal(p), af = ageF(p), ow = owners()[p.id], kp = ow ? keeperOf(p, ow) : null;
     lead += `<li class="info">Next season: about <b>${fmt(nv)}</b> points above waiver level. ${p.age ? `Players ${p.age} years old usually ${af >= 1.005 ? `gain about ${Math.round(100 * (af - 1))}%` : af <= 0.995 ? `lose about ${Math.round(100 * (1 - af))}%` : "hold steady"} a year in this league's scoring.` : ""}${kp ? ` He's one of ${ow === S.team ? "your" : esc(tname(ow)) + "'s"} 7 keepers.` : ow ? ` He's not in ${ow === S.team ? "your" : esc(tname(ow)) + "'s"} best 7 keepers.` : ""}</li>`;
@@ -1659,7 +1709,7 @@ function renderLeague() {
   const mx = Math.max(...rows.map((x) => x.v), 1);
   const m = META.matchups.find((x) => x[0] === per.n);
   const el = $("#tab-league");
-  el.innerHTML = `<div class="lede"><h2>League</h2><p>This week's matchups and every team's projected points for the rest of the season, with each team setting its best lineup every night. Tap a team to see its roster.</p></div>
+  el.innerHTML = `<div class="lede"><h2>League</h2><p>This week's matchups and every team's projected points for the rest of the season. Each team sets its best lineup every night (${CAP.C} C, ${CAP.W} W, ${CAP.D} D, ${CAP.G} G), so a player only counts on nights he'd actually start. Rosters are held to the league limit: ${META.roster.max} players plus 4 IR spots for injured players, so when a team's injured players come back, its weakest players are left out as if cut. Tap a team to see how many games each player would start.</p></div>
   ${m ? `<h3 class="sectitle">${isPlayoffs(per.n) ? "Playoffs · " : ""}Week ${per.n}${todayET() > per.s ? " · rest of week" : ""}</h3>
   <div class="mups">${m[1].map(([a, h]) => {
     const fav = W[a] >= W[h] ? a : h;
@@ -1668,16 +1718,23 @@ function renderLeague() {
   <h3 class="sectitle">Rest of season</h3>
   <div class="teams">${rows.map((x, i) => {
     const open = !!S.leagueOpen[x.t.id];
-    const lu = fillLineup(x.r);
     const lines = [];
-    for (const s of ["C", "W", "D", "G"]) for (const y of lu.slots[s]) lines.push([s, y.p, rosAt(y.p, s)]);
-    for (const p of lu.bench) lines.push(["BN", p, rosOf(p)]);
+    if (open) {
+      const ST = lineupStarts(x.r, daysIn(from, SEASON_END));
+      for (const p of x.r) {
+        const st = ST.get(p.id) || { n: 0, pts: 0, games: 0, by: {} };
+        const s = Object.entries(st.by).sort((a, b) => b[1] - a[1])[0];
+        lines.push([s ? s[0] : onIR(p.id) ? "IR" : "BN", p, st.pts, st]);
+      }
+      lines.sort((a, b) => b[2] - a[2]);
+    }
+    const irN = x.r.filter((p) => onIR(p.id)).length;
     return `<div class="tcard ${x.t.id === S.team ? "me" : ""}">
       <button class="th" data-team="${x.t.id}" aria-expanded="${open}"><div class="rk">${i + 1}</div>
-        <div><div class="tn">${esc(x.t.name)}</div><div class="ts">${x.r.length} players · ${x.r.filter(hurt).length} hurt</div></div>
+        <div><div class="tn">${esc(x.t.name)}</div><div class="ts">${x.r.length - irN} players${irN ? ` + ${irN} on IR` : ""} · ${x.r.filter(hurt).length} hurt</div></div>
         <div class="tp"><b>${fmt(x.v)}</b><small>proj pts</small></div></button>
       <div class="meter"><i style="width:${(100 * x.v) / mx}%"></i></div>
-      ${open ? `<div class="body">${lines.map(([s, p, pts]) => `<div class="mini"><span class="pos">${s}</span><span>${esc(p.n)} <span class="note">${esc(p.t)}${hurt(p) ? " · hurt" : ""}</span></span><b>${fmt(pts)}</b></div>`).join("")}</div>` : ""}
+      ${open ? `<div class="body"><div class="mini mhead"><span></span><span>Player · nights in the lineup</span><b>Pts</b></div>${lines.map(([s, p, pts, st]) => `<div class="mini"><span class="pos">${s}</span><span>${esc(p.n)} <span class="note">${esc(p.t)}${hurt(p) ? " · hurt" : ""} · ${st.games ? (st.cut >= st.games * 0.9 ? "would be cut" : `${st.n} of ${st.games}`) : "no games"}</span></span><b>${fmt(pts)}</b></div>`).join("")}</div>` : ""}
     </div>`;
   }).join("")}</div>`;
   el.querySelectorAll("[data-team]").forEach((b) => (b.onclick = () => { S.leagueOpen[b.dataset.team] = !S.leagueOpen[b.dataset.team]; renderLeague(); }));
@@ -1857,6 +1914,8 @@ function renderHow() {
   <h3>My team, trades and pickups</h3>
   <ul>
     <li><b>Night by night.</b> Every night, your best lineup is picked from the players who have a game, respecting ${CAP.C} C, ${CAP.W} W, ${CAP.D} D and ${CAP.G} G. On busy nights some good players sit; on quiet nights slots stay empty. That's why games played and roster balance matter as much as raw points.</li>
+    <li><b>Roster limits.</b> A team can carry ${META.roster.max} players plus 4 IR spots, and only injured or suspended players can sit on IR. So on any night, only a team's best ${META.roster.max} healthy players count (fewer if it has more than 4 injured). When a team's injured players come back, its weakest players drop out of the projection as if cut. A team listing 23 names doesn't get credit for 23.</li>
+    <li><b>Starts, not just games.</b> A player's value to a team is the points he scores on nights he'd actually be in its lineup. On busy nights some good players sit, so a deep team's 5th center might start only half his games. My team and League show each player's projected starts.</li>
     <li><b>The matchup</b> is the same calculation for both teams over this week's schedule. Goalies are counted at their chance of starting, so it assumes you don't know the starter in advance.</li>
     <li><b>Pickups</b> test every good free agent in your real lineup against your easiest drops, over the rest of the season or just this week. "Easiest to drop" means the player whose removal costs your lineup the fewest points.</li>
     <li><b>Trades</b> are judged two ways at once. <i>This season:</i> the rest of the season is replayed night by night for both rosters, with a team that ends up a player short picking up its best free agent and a team with one too many dropping its least useful player. <i>Next season:</i> the 7 keepers each team would carry (1 C, 2 W, 2 D, 1 G, 1 more skater) using next season's projection with the age effect, plus the 2027 picks it holds, each valued at where it's likely to land. "What counts for you" sets how much next season weighs (half, by default). Every team is first given the free-agent pickups it could make anyway, so a trade only gets credit for what waivers can't give. The <b>deal desk</b> tries single players, pairs, picks, and player-plus-pick packages from every team. The <b>name-value check</b> is one way: the other team must get at least 80% of what it gives by the experts' view (stars worth more than two lesser players, value to the power 1.5), so nothing suggested asks them to overpay; you're told when you'd be selling below market. <b>To even it</b> suggests the one extra player or pick that brings both sides' gains closest together.</li>
