@@ -321,11 +321,11 @@ for i, r in allp.iterrows():
         p["pid"] = int(r.playerId)
     players.append(p)
 
-# preseason breakout chances (build/breakout.py): chance a waiver-level skater plays like a fantasy starter
+# preseason breakout chances (build/breakout2.py): chance a fringe skater beats his projection by 30%+ and becomes worth rostering
 BO = json.load(open("data/breakout_2027.json"))
 for p in players:
     b = BO["players"].get(p["id"])
-    if b and (p["val"] is None or p["val"] < 0):
+    if b:   # the file only holds the pool: projected 40+ and below 1.2x waiver level
         p["bo"] = [b["p"], b["pb"]]
         if b["why"]: p["bw"] = b["why"]
 
@@ -363,9 +363,9 @@ meta["matchups"] = [[m["period"], [[x["away"]["id"], x["home"]["id"]] for x in m
 meta["experts"] = dict(sources=EX.SOURCES_TEXT, asOf=NEWS.AS_OF, n=len(EX.SOURCES_TEXT))
 meta["newsAsOf"] = NEWS.AS_OF
 meta["expTest"] = json.load(open("data/expert_report.json"))
-meta["breakout"] = dict(uplift=BO["uplift"], base=BO["base"], chg=7.06,
-    test=dict(auc=0.82, auc_proj=0.81, top30=0.50, base_rate=0.15, flag_hold=0.60, hot_hold="34-46%",
-              pre_miss=0.495, blend_miss=0.475, early_only_miss=1.196))
+# breakout = beats his projection by 30%+ and finishes at or above waiver level (build/breakout2.py)
+_BM = json.load(open("data/breakout2_meta.json"))
+meta["breakout"] = dict(uplift=_BM["uplift"], base=_BM["base"], chg=_BM["chg"], jump=_BM["jump"], test=_BM["test"])
 meta["live"] = dict(raw="https://raw.githubusercontent.com/Albierrto/zamboniboyz/main/docs/data/live.json", local="data/live.json")
 meta["adpNote"] = "Fantrax average draft position across all Fantrax NHL drafts, as of " + datetime.date.today().isoformat()
 import os; os.makedirs("site/data", exist_ok=True)
