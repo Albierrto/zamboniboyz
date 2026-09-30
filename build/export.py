@@ -298,7 +298,9 @@ for i, r in allp.iterrows():
         p["ret"] = r.inj_ret; p["miss"] = int(r.miss)
     p["wx"] = rnd(r.w_exp, 2)
     if kind == "S" and not rookie:
-        gp = r.proj_gp; blend = r.proj_pts_final / (r.ppg * gp) if r.ppg * gp else 1
+        # scale with the per-game rate at the slot he's shown at (a W/C's best raw slot is C, which counts faceoffs)
+        gp = r.proj_gp; ppg_s = r.get("ppg_" + r.slot); ppg_s = ppg_s if pd.notna(ppg_s) and ppg_s else r.ppg
+        blend = r.proj_pts_final / (ppg_s * gp) if ppg_s * gp else 1
         sc = M.SK[r.slot]
         p["gp"] = rnd(gp, 0)
         p["line"] = dict(g=rnd(r.g * gp, 0), a=rnd(r.a * gp, 0), pm=rnd(r.pm * gp, 0), pim=rnd(r.pim * gp, 0), hit=rnd(r.hit * gp, 0),
