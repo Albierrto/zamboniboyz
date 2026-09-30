@@ -143,7 +143,7 @@ function trendTag(p) {
 }
 function outTag(p) { const l = liveOf(p); return l && l.out ? `<span class="pill bad" title="His team played ${l.out} games in the last 10 days and he played none">Not playing lately</span>` : ""; }
 const RC = new Map(), EC = new Map();
-function clearCaches() { MEMO.clear(); RC.clear(); EC.clear(); GL.clear(); NL.clear(); GSS.o = null; }
+function clearCaches() { MEMO.clear(); RC.clear(); EC.clear(); GL.clear(); NL.clear(); ORD.clear(); NM.clear(); MSC.v = -1; GSS.o = null; }
 function rateAt(p, s) {
   const k = p.id + s + (MKT.on ? "m" : "");
   let r = RC.get(k);
@@ -320,8 +320,68 @@ function nightTotal(on, day) {
 // all of them when its injured players come back.
 const CAPX = { off: false };
 function keepVal(p) { const s = elig(p)[0]; return bestRate(p) - (REPL[s] || 0) / 82; }
+// Who a team would cut when it's over the limit: the player whose loss costs its lineup the least, counting who'd
+// fill in for him (a 5th winger's nights get covered by other wingers; a 3rd goalie's often can't be). Worked out
+// greedily, one cut at a time, only for rosters that are ever over the limit. Cut players go to the end of the order.
+const ORD = new Map();
+function overLimit(roster, days) {
+  const cap = META.roster.max, irs = (META.rules && META.rules.irSlots) || 4;
+  for (const day of days) {
+    let h = 0, hurtN = 0;
+    for (const p of roster) { if (p.ret && day.d < p.ret) hurtN++; else h++; }
+    if (h > cap - Math.max(0, hurtN - irs)) return true;
+  }
+  return false;
+}
+// each night: what every starter adds over the best bench player who could take his spot (cached by who plays)
+const NM = new Map();
+function nightMarg(on, day) {
+  let k = "";
+  for (const p of on) k += p.id + (GBM.has(p.id) ? "@" + day.d : "") + ",";
+  let v = NM.get(k);
+  if (!v) {
+    v = [];
+    const nl = nightLineup(on, true, day), bench = on.filter((p) => !nl.start.has(p.id));
+    for (const p of on) {
+      const sl = nl.start.get(p.id); if (!sl) continue;
+      let sub = 0;
+      for (const q of bench) if (elig(q).includes(sl)) sub = Math.max(sub, rateOn(q, sl, day));
+      v.push([p.id, rateOn(p, sl, day) - sub]);
+    }
+    if (NM.size > 200000) NM.clear();
+    NM.set(k, v);
+  }
+  return v;
+}
+function marginals(list, days) {
+  const L = list.slice().sort((a, b) => (a.id < b.id ? -1 : 1));
+  const m = new Map(L.map((p) => [p.id, 0]));
+  for (const day of days) {
+    const on = L.filter((p) => plays(p, day));
+    if (!on.length) continue;
+    for (const [id, x] of nightMarg(on, day)) m.set(id, m.get(id) + x);
+  }
+  return m;
+}
+// each player's usefulness on his real team (computed once per team); a free agent being added counts as kept
+const MSC = { v: -1, m: new Map(), teams: new Set() };
+function msOf(p) {
+  if (MSC.v !== ROV) { MSC.v = ROV; MSC.m = new Map(); MSC.teams = new Set(); }
+  const ow = owners()[p.id];
+  if (!ow) return Infinity;
+  if (!MSC.teams.has(ow)) { MSC.teams.add(ow); for (const [id, x] of marginals(rosterOf(ow), rosDays())) MSC.m.set(id, x); }
+  return MSC.m.get(p.id) ?? 0;
+}
 function rosterOrder(roster) {
-  return roster.map((p) => [p, keepVal(p)]).sort((a, b) => b[1] - a[1] || (a[0].id < b[0].id ? -1 : 1)).map((x) => x[0]);
+  const key = roster.map((p) => p.id).sort().join(",");
+  let R = ORD.get(key);
+  if (R) return R;
+  const byKeep = (a, b) => b[1] - a[1] || (a[0].id < b[0].id ? -1 : 1);
+  if (!CAPX.off && roster.length > META.roster.max && overLimit(roster, rosDays())) R = roster.map((p) => [p, msOf(p)]).sort(byKeep).map((x) => x[0]);
+  else R = roster.map((p) => [p, keepVal(p)]).sort(byKeep).map((x) => x[0]);
+  if (ORD.size > 20000) ORD.clear();
+  ORD.set(key, R);
+  return R;
 }
 function activeOn(R, day) {
   const cap = META.roster.max, irs = (META.rules && META.rules.irSlots) || 4, on = [];
@@ -983,9 +1043,13 @@ function renderTeam() {
     li.querySelectorAll("[data-tab]").forEach((b) => (b.onclick = () => setTab(b.dataset.tab)));
   });
 }
+function backNames(team) {
+  const L = rosterOf(team).filter((q) => hurt(q)).map((q) => q.n.split(" ").slice(-1)[0]);
+  return L.length ? L.join(" and ") : "your injured players";
+}
 function startsText(st, p) {
   if (!st || !st.games) return "";
-  if (st.cut >= st.games * 0.9) return p && hurt(p) ? "you'll be over the roster limit when he's back, and he'd be the one to cut" : "would be cut once your injured players return";
+  if (st.cut >= st.games * 0.9) return p && hurt(p) ? "you'll be over the roster limit when he's back, and he'd be the one to cut" : `the one to cut when ${esc(backNames(S.team))} ${backNames(S.team).includes(" and ") ? "come" : "comes"} back (18-man limit)`;
   return `in the lineup ${st.n} of ${st.games} games`;
 }
 function rowMini(p, pts, s, st) {
@@ -1631,7 +1695,7 @@ function detailHTML(p) {
   if (hurt(p) || dtd(p)) lead = `<li class="bad">${esc(injWhat(p))}${hurt(p) && !(dtd(p) && !missedGames(p)) ? `: expected back around <b>${esc(dLabel(p.ret, { month: "short", day: "numeric" }))}</b>${missedGames(p) ? `, so he misses about ${missedGames(p)} of his team's games` : ""}` : ": he might miss a game"}.${ij ? ` From ESPN's NHL injury report (${esc(dLabel(ij.d, { month: "short", day: "numeric" }))}), checked several times a day; every projection on this site already counts it.` : ""}</li>` + lead;
   if (!p.unknown && p.gm > 0 && owners()[p.id]) {
     const ow = owners()[p.id], st = lineupStarts(rosterOf(ow), rosDays()).get(p.id);
-    if (st && st.games) lead += `<li class="info">${st.cut >= st.games * 0.9 ? `${esc(tname(ow))} is over the roster limit once its injured players return, so he'd likely be cut.` : `In ${ow === S.team ? "your" : esc(tname(ow)) + "'s"} lineup about <b>${st.n}</b> of his ${st.games} remaining games (${Math.round(st.pts)} points); the other nights he'd sit behind better players at his position.`}</li>`;
+    if (st && st.games) lead += `<li class="info">${st.cut >= st.games * 0.9 ? (ow === S.team ? `When ${esc(backNames(ow))} ${backNames(ow).includes(" and ") ? "come" : "comes"} back you'll be over the 18-player limit, and he's the player your lineup would miss least, so he's the one to drop or trade.` : `${esc(tname(ow))} will be over the roster limit once its injured players return, and he's the player it would miss least, so he'd likely be cut.`) : `In ${ow === S.team ? "your" : esc(tname(ow)) + "'s"} lineup about <b>${st.n}</b> of his ${st.games} remaining games (${Math.round(st.pts)} points); the other nights he'd sit behind better players at his position.`}</li>`;
   }
   if (!p.unknown && p.gm > 0) {
     const nv = nextVal(p), af = ageF(p), ow = owners()[p.id], kp = ow ? keeperOf(p, ow) : null;
