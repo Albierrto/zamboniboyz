@@ -122,6 +122,15 @@ let LIVE = null; // docs/data/live.json: season-to-date updates written by the r
 function liveOf(p) { return (LIVE && LIVE.players && LIVE.players[p.id]) || null; }
 function liveMult(p) { const l = liveOf(p); if (!l || !l.m) return null; const v = l.m[p.slot] ?? Object.values(l.m)[0]; return v == null ? null : v; }
 // breakout chance: preseason model, updated by how much his projection has moved since (tested on 5 past seasons)
+// Veterans beat their projection by 30% about as often as young players (build/breakout_age.py), but with about
+// the same ice time and they keep less of it the season after, so for them it's called a big year, not a breakout.
+function isVet(p) { const a = META.breakout.test.age; return !!(p.age && a && p.age >= a.old_age); }
+function boWord(p) { return isVet(p) ? "Big year" : "Breakout"; }
+function vetNote(p) {
+  const a = META.breakout.test.age;
+  return ` At ${p.age} that would be a big year, not a new level: in past seasons, veterans who did it got there with about the same ice time (+${fmt(a.dtoi_old, 1)} min a game, vs +${fmt(a.dtoi_young, 1)} for younger players) and kept about ${Math.round(100 * a.keep_old)}% of it the next season (${Math.round(100 * a.keep_young)}% for younger ones). Fine for a pickup this season; don't pay keeper prices for it.`;
+}
+const BOTITLE = (p) => `Chance he beats his projection by 30% or more and ends up worth a roster spot${isVet(p) ? ". At his age that's usually a big year, not a new level" : ""}`;
 function boP(p) {
   if (!p.bo) return null;
   const p0 = Math.min(0.97, Math.max(0.01, p.bo[0]));
@@ -1002,7 +1011,7 @@ function renderTeam() {
     todo.push(`<li><b>Pick up ${esc(addPick.p.n)}</b> (${esc(addPick.p.t)}) and drop ${esc(addPick.drop.n)}: about ${sgn(addPick.gain)} points for the rest of the season. <button class="linkbtn" data-tab="adds">All pickups</button></li>`);
   }
   const stash = breakouts(S.team)[0];
-  if (stash && stash.b >= 0.22) todo.push(`<li><b>Keep an eye on ${esc(stash.p.n)}</b> (${esc(stash.p.t)}): the best breakout bet on waivers, a ${Math.round(100 * stash.b)}% chance he beats his projection by 30% or more and ends up worth a roster spot (${Math.round(100 * stash.p.bo[1])}% is typical for a player projected like him). Worth a bench spot if you have a weak one. <button class="linkbtn" data-bo="1">Breakout list</button></li>`);
+  if (stash && stash.b >= 0.22) todo.push(`<li><b>Keep an eye on ${esc(stash.p.n)}</b> (${esc(stash.p.t)}): the best ${isVet(stash.p) ? "big-year" : "breakout"} bet on waivers, a ${Math.round(100 * stash.b)}% chance he beats his projection by 30% or more and ends up worth a roster spot (${Math.round(100 * stash.p.bo[1])}% is typical for a player projected like him). Worth a bench spot if you have a weak one. <button class="linkbtn" data-bo="1">Breakout list</button></li>`);
   const chip = roster.filter(analystsBacked).sort((a, b) => mval(b) - mval(a))[0];
   if (chip) todo.push(`<li><b>Shop ${esc(chip.n)} in trades.</b> The experts rank him ${ordinal(chip.mr)} among ${POSPL[chip.slot]}, but our numbers have him ${ordinal(chip.orank)} for this league's scoring, so other managers will likely value him more than he helps you. Use him to get what you need. <button class="linkbtn" data-shopid="${esc(chip.id)}">Find trades for him</button></li>`);
   todo.push(`<li><b>Check goalies each game day.</b> A goalie who doesn't start scores nothing, so swap him out if he's on the bench.</li>`);
@@ -1131,7 +1140,7 @@ function boCard(x, rank) {
     <button class="row" data-atoggle="${esc(p.id)}" aria-expanded="${open}">
       <div class="rank">${rank}</div>${face(p)}
       <div class="who"><div class="nm">${esc(p.n)}</div><div class="mt">${posBadge(p)}<span>${esc(p.t)}${p.age ? ` · ${p.age}` : ""}</span></div></div>
-      <div class="bigpts"><div class="p">${Math.round(100 * x.b)}%</div><div class="l">breakout chance</div></div>
+      <div class="bigpts"><div class="p">${Math.round(100 * x.b)}%</div><div class="l">${isVet(p) ? "big-year" : "breakout"} chance</div></div>
     </button>
     <div class="subrow">${tags.join("")}</div>
     ${why ? `<ul class="why bwhy">${why}</ul>` : ""}
@@ -1157,11 +1166,13 @@ function renderAdds() {
     </div>
     ${res.os ? `<div class="banner"><b>You have an open roster spot</b>${res.os.who ? ` because ${esc(res.os.who.n)} is on IR` : ""}, so your next pickup doesn't need a drop${res.os.until ? ` until he's back (around ${esc(dLabel(res.os.until, { month: "short", day: "numeric" }))}). After that you'll have to drop someone, and the points below already count that` : ""}.</div>` : ""}
     <div class="banner soft"><b>Easiest to drop right now:</b> ${drops.map((d) => `${esc(d.p.n)} (adds ${fmt(d.c)})`).join(", ")}. That's how many points each adds to your lineup over the rest of the season once your other players are counted, so these are the only players suggested as drops.</div>
+    ${mode === "ros" ? notTopBanner(res, good) : ""}
     <div class="list" id="addList">${good.slice(0, S.addShow).map((x, i) => addCard(x, i + 1, mode, res.list)).join("") || `<div class="empty">No free agent beats your current roster ${mode === "week" ? "this week" : "right now"}. Check back as news comes in.</div>`}</div>
     <button class="more" id="addMore" ${good.length > S.addShow ? "" : "hidden"}>Show more</button>`;
   el.querySelectorAll("[data-mode]").forEach((b) => (b.onclick = () => { S.addMode = b.dataset.mode; LS.set("zb-addmode", S.addMode); S.addShow = 25; renderAdds(); }));
   el.querySelectorAll("[data-apos]").forEach((b) => (b.onclick = () => { S.addPos = b.dataset.apos; S.addShow = 25; renderAdds(); }));
   $("#addMore").onclick = () => { S.addShow += 25; renderAdds(); };
+  { const wn = el.querySelector(".whynot"); if (wn) wn.addEventListener("toggle", () => (S.whyOpen = wn.open)); }
   $("#addList").onclick = (e) => {
     const sh = e.target.closest("[data-shop]"); if (sh) { shopPlayer(sh.dataset.shop); return; }
     const b = e.target.closest("[data-atoggle],[data-star]"); if (!b) return;
@@ -1174,7 +1185,7 @@ function renderBreakouts(el) {
   const chips = [["ALL", "All"], ["C", "C"], ["W", "W"], ["D", "D"]];
   const t = META.breakout.test;
   el.innerHTML = `
-    <div class="lede"><h2>Pickups</h2><p>Free agents with the most <b>breakout</b> upside: players with the best chance to <b>beat their projection by 30% or more</b> and end up worth a roster spot, ranked by how much that chance beats what's typical for a player projected like them. Stash one on your bench when you have a spare spot; if it doesn't happen, drop him.</p></div>
+    <div class="lede"><h2>Pickups</h2><p>Free agents with the most <b>breakout</b> upside: players with the best chance to <b>beat their projection by 30% or more</b> and end up worth a roster spot, ranked by how much that chance beats what's typical for a player projected like them. For players 30 and up it's called a big year: it happens about as often, but it rarely lasts. Stash one on your bench when you have a spare spot; if it doesn't happen, drop him.</p></div>
     <div class="controls">
       <div class="chips" role="group" aria-label="Time frame"><button data-mode="ros" aria-pressed="false">Rest of season</button><button data-mode="week" aria-pressed="false">This week</button><button data-mode="bo" aria-pressed="true">Breakouts</button></div>
       <div class="chips" role="group" aria-label="Position">${chips.map(([k, l]) => `<button data-apos="${k}" aria-pressed="${S.addPos === k}">${l}</button>`).join("")}</div>
@@ -1217,12 +1228,40 @@ function forYou(x, mode, list) {
   const v = valOf(p), vs = valSlot(p);
   if (v != null && v < -1 && !gk) {
     const flex = by.length > 1 && by[1][1] >= 0.2 * o.n;
-    const top = faPool(vs).filter((q) => q !== p).sort((a, b) => seasonAt(b, vs) - seasonAt(a, vs))[0];
-    const tx = top && list ? list.find((y) => y.p === top) : null;
     if (flex) txt += ` He projects fewer season points than the best free-agent ${POSPL[vs]}, but he can play ${by.map(([sl]) => POSNAME[sl].toLowerCase()).join(" or ")}, so he fills whichever spot is open each night.`;
-    if (tx && tx.gain + tx.up < x.gain + x.up) txt += ` ${esc(top.n)} projects more over a season but adds less for you (${sgn(tx.gain)}).`;
   }
   return txt;
+}
+// "Why not just grab the best free agent?": for each position where the best free agent on paper isn't near the top
+// of your list, the reason he helps you less.
+function notTopBanner(res, good) {
+  const R = rosterOf(S.team), days = res.days, st0 = lineupStarts(R, days), items = [];
+  for (const s of SLOTS) {
+    if (S.addPos !== "ALL" && S.addPos !== s) continue;
+    const top = faPool(s).sort((a, b) => seasonAt(b, s) - seasonAt(a, s))[0];
+    const tx = top ? res.list.find((y) => y.p === top) : null;
+    if (!tx || good.slice(0, 3).includes(tx) || tx.gain >= 5) continue;
+    items.push(whyNotTop(top, tx, s, R, days, st0));
+  }
+  return items.length ? `<details class="banner soft whynot"${S.whyOpen ? " open" : ""}><summary><b>Why not just grab the best free agent?</b></summary><p>Points gained only counts the nights a player would actually be in your lineup, and what he scores over the player he'd replace.</p><ul>${items.map((t) => `<li>${t}</li>`).join("")}</ul></details>` : "";
+}
+// Why the best free agent at a position (by season points) helps this team less: he'd sit on most of his nights,
+// or he'd replace a player on the same NHL team (same nights) who scores about as much a game.
+function whyNotTop(top, tx, vs, R, days, st0) {
+  const d = tx.drop && tx.drop !== top && !tx.free ? tx.drop : null;
+  const R2 = (d ? R.filter((q) => q !== d) : R).concat([top]), st1 = lineupStarts(R2, days), st = st1.get(top.id);
+  const n0 = (q) => (st0.get(q.id) ? st0.get(q.id).n : 0), n1 = (q) => (st1.get(q.id) ? st1.get(q.id).n : 0);
+  const main = R.map((q) => ({ q, n: q === d ? n0(q) : n0(q) - n1(q) })).filter((z) => z.n > 0).sort((x, y) => y.n - x.n)[0];
+  const pre = `<b>${esc(top.n)}</b>, the best free-agent ${({ C: "center", W: "winger", D: "defenseman", G: "goalie" })[vs]} on paper:`;
+  const end = `${d ? `Swapping him in for ${esc(lastName(d))} comes out` : "He adds"} <b>${sgn(tx.gain)}</b> for you.`;
+  const mate = R.find((q) => q !== top && q.t && q.t === top.t && elig(q).includes(vs) && n0(q) > 0);
+  if (mate) {
+    const a = rateAt(top, vs), b = rateAt(mate, vs), close = Math.abs(a - b) <= 0.1 * Math.max(a, b);
+    return `${pre} he plays for the same team as ${esc(mate.n)} (${esc(top.t)}), so his games land on the same nights${close ? `, and ${esc(lastName(mate))} scores about as much a game (${fmt(b, 1)} vs ${fmt(a, 1)})` : ""}. ${end}`;
+  }
+  if (st && st.games && st.n < 0.8 * st.games) return `${pre} he'd only make your lineup about ${st.n} of his ${st.games} games because your ${POSPL[vs]} are already full on most of his nights. ${end}`;
+  if (main) return `${pre} he'd mostly take ${esc(lastName(main.q))}'s nights, and ${esc(lastName(main.q))} scores about as much a game (${fmt(rateAt(main.q, vs), 1)} vs ${fmt(rateAt(top, vs), 1)}). ${end}`;
+  return `${pre} ${end}`;
 }
 function addCard(x, rank, mode, list) {
   const p = x.p, open = S.addOpen === p.id;
@@ -1240,7 +1279,7 @@ function addCard(x, rank, mode, list) {
   if (p.rk) tags.push(`<span class="pill gold">Rookie</span>`);
   if (p.mr && p.orank && p.mr + 8 <= p.orank) tags.push(`<span class="pill good" title="Analysts rank him higher than our stats do">Analysts like him</span>`);
   if (x.up >= 1.5) tags.push(`<span class="tag" title="Ranked with a small bonus for breakout upside: a quarter of the extra points a breakout usually brings, times his chance">Upside <b>+${Math.round(x.up)}</b></span>`);
-  const bp = boP(p); if (bp && bp >= 0.2) tags.push(`<span class="pill gold" title="Chance he beats his projection by 30% or more and ends up worth a roster spot">Breakout ${Math.round(100 * bp)}%</span>`);
+  const bp = boP(p); if (bp && bp >= 0.2) tags.push(`<span class="pill gold" title="${esc(BOTITLE(p))}">${boWord(p)} ${Math.round(100 * bp)}%</span>`);
   const tt = trendTag(p); if (tt) tags.push(tt);
   const ot = outTag(p); if (ot) tags.push(ot);
   tags.push(starBtn(p));
@@ -1728,7 +1767,7 @@ function cardHTML(p, rank, key, owner, wk) {
   if (p.mr) tags.push(`<span class="tag" title="Where the analyst consensus ranks him among ${POSPL[p.slot]}">Analysts: <b>${ordinal(p.mr)} ${esc(p.slot)}</b></span>`);
   { const it = injTag(p); if (it) tags.push(it); }
   if (p.rk) tags.push(`<span class="pill gold">Rookie</span>`);
-  const bp2 = boP(p); if (bp2 && bp2 >= 0.2) tags.push(`<span class="pill gold" title="Chance he beats his projection by 30% or more and ends up worth a roster spot">Breakout ${Math.round(100 * bp2)}%</span>`);
+  const bp2 = boP(p); if (bp2 && bp2 >= 0.2) tags.push(`<span class="pill gold" title="${esc(BOTITLE(p))}">${boWord(p)} ${Math.round(100 * bp2)}%</span>`);
   const tt2 = trendTag(p); if (tt2) tags.push(tt2);
   const ot2 = outTag(p); if (ot2) tags.push(ot2);
   if (p.nt) tags.push(`<span class="pill bad">No NHL contract</span>`);
@@ -1764,7 +1803,7 @@ function detailHTML(p) {
     lead += `<li class="info">Our stats say <b>${fmt(p.mp)}</b> points. The analysts' consensus (${p.mr ? ordinal(p.mr) + " " + pn : "unranked"}) works out to about <b>${fmt(p.mk)}</b> in this scoring. His number, <b>${fmt(ptsOf(p))}</b>, is ${w != null ? `${w}% ours` : "a blend"}.</li>`;
   }
   const bpd = boP(p);
-  if (bpd != null) lead += `<li class="good">Breakout chance: <b>${Math.round(100 * bpd)}%</b> that he beats his projection by 30% or more and ends up worth a roster spot (typical for a player projected like him: ${Math.round(100 * p.bo[1])}%).${p.bw && p.bw.length ? " Why: " + p.bw.map(esc).join("; ") + "." : ""}</li>`;
+  if (bpd != null) lead += `<li class="good">${isVet(p) ? "Big-year" : "Breakout"} chance: <b>${Math.round(100 * bpd)}%</b> that he beats his projection by 30% or more and ends up worth a roster spot (typical for a player projected like him: ${Math.round(100 * p.bo[1])}%).${isVet(p) ? vetNote(p) : ""}${p.bw && p.bw.length ? " Why: " + p.bw.map(esc).join("; ") + "." : ""}</li>`;
   const lv = liveOf(p);
   if (lv && lv.n) lead += `<li class="info">This season so far: ${lv.n} game${lv.n === 1 ? "" : "s"}, ${fmt(lv.fp)} fantasy points${lv.toi ? `, ${fmt(lv.toi, 1)} min a game` : ""}${lv.pp ? ` (${fmt(lv.pp, 1)} on the power play)` : ""}. His projection has moved ${sgn(100 * ((liveMult(p) || 1) - 1))}% since the season started.</li>`;
   const ij = injOf(p);
@@ -1994,7 +2033,8 @@ function renderHow() {
   ${deepDive()}
   <h3>Breakouts and in-season updates</h3>
   <ul>
-    <li><b>Breakout</b> means a player beats his own projection by 30% or more <i>and</i> ends the season worth a roster spot (at or above waiver level). Chances are given for skaters projected from 40 points up to a little above waiver level. Before the season they come from last season's ice time, games missed, on-ice numbers, age and where the analysts rank him. Tested on nine past seasons, the top 30 each year broke out ${Math.round(100 * META.breakout.test.top30)}% of the time, about double the ${Math.round(100 * META.breakout.test.base_rate)}% for everyone else in that range, and nobody is much better than 1 in 4 before games start. Age matters less than you'd think, because projections already expect young players to improve; what stands out is big minutes, his team scoring with him on the ice, and analysts rating him above our numbers.</li>
+    <li><b>Breakout</b> means a player beats his own projection by 30% or more <i>and</i> ends the season worth a roster spot (at or above waiver level). Chances are given for skaters projected from 40 points up to a little above waiver level. Before the season they come from last season's ice time, games missed, on-ice numbers, age and where the analysts rank him. Tested on nine past seasons, the top 30 each year broke out ${Math.round(100 * META.breakout.test.top30)}% of the time, about double the ${Math.round(100 * META.breakout.test.base_rate)}% for everyone else in that range, and nobody is much better than 1 in 4 before games start. What stands out is big minutes, his team scoring with him on the ice, and analysts rating him above our numbers.</li>
+    <li><b>Age:</b> unlike baseball, veterans do this about as often as young players (${Math.round(100 * META.breakout.test.age.rate_old)}% of players 30 and up vs ${Math.round(100 * META.breakout.test.age.rate_young)}% of younger ones in that range), because a hockey season swings a lot with linemates, assists, plus/minus and games played. What differs is what it means. Younger players usually got there with a bigger job (${Math.round(100 * META.breakout.test.age.role_young)}% gained 1.5+ minutes a night or more power-play time, vs ${Math.round(100 * META.breakout.test.age.role_old)}% of veterans), and veterans kept less of it the next season (${Math.round(100 * META.breakout.test.age.keep_old)}% vs ${Math.round(100 * META.breakout.test.age.keep_young)}%). So for players 30 and up the site calls it a <b>big year</b>: worth a pickup, not a keeper price.</li>
     <li><b>Once games start</b>, a refresh job pulls this season's stats from the NHL several times a day and moves every projection. How fast depends on the stat, tested on five past seasons: faceoffs and hits settle within a couple of weeks; goals barely count early because hot shooting streaks don't last. More ice time or a bigger power-play role adds on top. Breakout chances move with it: in testing, about 10 games in, players the update put at 40% or more broke out ${Math.round(100 * META.breakout.test.ins.g10.flag)}% of the time (${Math.round(100 * META.breakout.test.ins.g20.flag)}% by 20 games), while simply chasing a hot start (scoring 30% above his projection) worked ${Math.round(100 * META.breakout.test.ins.g10.hot)}% of the time (${Math.round(100 * META.breakout.test.ins.g20.hot)}% by 20 games).</li>
     <li><b>Pickups</b> give a small bonus for breakout upside (a quarter of the extra points a breakout usually brings, since you can drop him if it doesn't happen), so between two similar free agents the one with more upside ranks first.</li>
     <li><b>Not playing lately</b> means his team played 3 or more games in the last 10 days and he didn't play: usually an injury or healthy scratch.</li>
