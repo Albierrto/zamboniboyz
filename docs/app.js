@@ -57,6 +57,9 @@ const ET = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year
 let TD = { t: 0, v: "" };
 const todayET = () => { const n = Date.now(); if (n - TD.t > 20000) TD = { t: n, v: ET.format(new Date(n)) }; return TD.v; };
 const dLabel = (d, o) => new Date(d + "T12:00:00").toLocaleDateString([], o || { weekday: "short", month: "short", day: "numeric" });
+// an injury return date after the last regular-season game means he's out for the season (the report's date is next year's)
+const outForSeason = (p) => !!(p.ret && p.ret > META.sched.days[META.sched.days.length - 1][0]);
+const backWhen = (p) => (outForSeason(p) ? "out for the season" : `back around ${dLabel(p.ret, { month: "short", day: "numeric" })}`);
 const SCH = META.sched.teams;
 const DAYS = META.sched.days.map(([d, idx]) => ({ d, teams: new Set(idx.map((i) => SCH[i])) }));
 const SEASON_START = DAYS[0].d, SEASON_END = DAYS[DAYS.length - 1].d;
@@ -238,7 +241,7 @@ function injTag(p, short) {
   const when = p.ret ? dLabel(p.ret, { month: "short", day: "numeric" }) : "";
   const x = injOf(p), word = x && x.s === "susp" ? "Suspended" : "Hurt";
   if (dtd(p)) return `<span class="pill gold" title="${esc(injWhat(p))}: may miss a game${hurt(p) && missedGames(p) ? ` (the report expects him back ${esc(when)})` : ""}. Check the news before starting him.">Day-to-day</span>`;
-  if (hurt(p)) return `<span class="pill bad" title="${esc(injWhat(p))}${when ? `. Expected back around ${esc(when)}` : ""}">${short ? word : `${word} until ${esc(when)}`}</span>`;
+  if (hurt(p)) return `<span class="pill bad" title="${esc(injWhat(p))}${when ? (outForSeason(p) ? ". Out for the season" : `. Expected back around ${esc(when)}`) : ""}">${short ? word : outForSeason(p) ? `${word}: out for season` : `${word} until ${esc(when)}`}</span>`;
   return "";
 }
 function applyInjuries() {
@@ -509,23 +512,16 @@ function openSpot(roster) {
 }
 // what adding p is worth over these days. With an open spot: free until the IR player is back, then he
 // replaces your weakest player (or gets dropped again if he's not better than any of them).
+// Every drop candidate is kept as an option (best first), so the card can show what each choice does.
 function addGain(roster, p, days, drops, os, bases) {
   if (!os) {
-    let best = null;
-    for (const d of drops) {
-      const g = rangeValue(roster.filter((x) => x !== d.p).concat([p]), days) - bases.all;
-      if (!best || g > best.g) best = { g, drop: d.p, dc: d.c };
-    }
-    return best;
+    const opts = drops.map((d) => ({ g: rangeValue(roster.filter((x) => x !== d.p).concat([p]), days) - bases.all, drop: d.p, dc: d.c })).sort((a, b) => b.g - a.g);
+    return opts.length ? { ...opts[0], opts } : null;
   }
   const g1 = bases.pre.length ? rangeValue(roster.concat([p]), bases.pre) - bases.preV : 0;
-  if (!bases.post.length) return { g: g1, drop: null, dc: 0, free: true };
-  let best = { g: 0, drop: p, dc: 0 };
-  for (const d of drops) {
-    const g = rangeValue(roster.filter((x) => x !== d.p).concat([p]), bases.post) - bases.postV;
-    if (g > best.g) best = { g, drop: d.p, dc: d.c };
-  }
-  return { g: g1 + best.g, drop: best.drop, dc: best.dc, free: true };
+  if (!bases.post.length) return { g: g1, drop: null, dc: 0, free: true, opts: [] };
+  const opts = [{ g: g1, drop: p, dc: 0 }].concat(drops.map((d) => ({ g: g1 + rangeValue(roster.filter((x) => x !== d.p).concat([p]), bases.post) - bases.postV, drop: d.p, dc: d.c }))).sort((a, b) => b.g - a.g);
+  return { ...opts[0], free: true, opts };
 }
 function gainBases(roster, days, os, all) {
   if (!os) return { all };
@@ -551,7 +547,7 @@ function pickups(team, mode) {
     const out = [];
     for (const { p } of pool) {
       const best = addGain(roster, p, days, drops, os, bases);
-      const item = { p, gain: best.g, drop: best.drop, dropC: best.dc, games: gamesIn(p, days), free: !!best.free };
+      const item = { p, gain: best.g, drop: best.drop, dropC: best.dc, games: gamesIn(p, days), free: !!best.free, opts: best.opts || [] };
       // upside: you can drop him if the breakout doesn't come, so part of a breakout's extra points counts
       const bp = boP(p);
       item.up = mode === "ros" && bp ? 0.25 * bp * META.breakout.uplift * Math.min(1, item.games / 82) : 0;
@@ -561,7 +557,7 @@ function pickups(team, mode) {
     if (mode === "week") {  // what the swap does to the rest of your season
       for (const x of out.slice(0, 40)) x.rosDelta = os ? addGain(roster, x.p, rosDays, drops, os, rosBases).g : rangeValue(roster.filter((y) => y !== x.drop).concat([x.p]), rosDays) - baseRos;
     }
-    return { list: out, base, contrib: contrib.filter((x) => !onIR(x.p.id)), days, os };
+    return { list: out, base, contrib: contrib.filter((x) => !onIR(x.p.id)), days, os, rosDays, baseRos, rosBases, drops };
   });
 }
 
@@ -968,7 +964,6 @@ function renderTeam() {
   const rk = LSH.rank[S.team] || {};
   const mine = LSH.all.find((x) => x.id === S.team).sh;
   const lu = fillLineup(roster);
-  const adds = pickups(S.team, "ros").list.filter((x) => x.gain >= 5);
   const games = roster.reduce((a, p) => a + gamesIn(p, wk), 0), oppGames = opp ? rosterOf(opp).reduce((a, p) => a + gamesIn(p, wk), 0) : 0;
   const word = { C: "centers", W: "wingers", D: "defensemen", G: "goalies" };
   const weak = SLOTS.slice().sort((a, b) => rk[b] - rk[a]).filter((s) => rk[s] >= 7).slice(0, 2);
@@ -992,7 +987,7 @@ function renderTeam() {
       <div class="th2"><div><div class="k">Set your lineup for</div><div class="d">${esc(dLabel(night.d, { weekday: "long", month: "short", day: "numeric" }))}</div></div><div class="tp"><b class="num">${fmt(nl.total, 1)}</b><small>expected pts</small></div></div>
       <p class="note">In Fantrax, put these players in your starting spots. Numbers are expected points that night.</p>
       <div class="lgrid">${SLOTS.map(slotLine).join("")}</div>
-      <div class="benchline">${sit.length ? `<div><b>Bench these (they play, but your starters are better):</b> ${sit.map((p) => esc(p.n)).join(", ")}</div>` : ""}${hurtOut.length ? `<div class="bad"><b>Hurt, leave out:</b> ${hurtOut.map((p) => `${esc(p.n)} (back around ${esc(dLabel(p.ret, { month: "short", day: "numeric" }))})`).join(", ")}</div>` : ""}${off.length ? `<div><b>No game this night:</b> ${off.map((p) => esc(p.n)).join(", ")}</div>` : ""}${empties >= 3 ? `<div>${empties} starting spots are empty that night. A free agent who plays then is free points: see <button class="linkbtn" data-tab="adds">Pickups → This week</button>.</div>` : ""}</div>
+      <div class="benchline">${sit.length ? `<div><b>Bench these (they play, but your starters are better):</b> ${sit.map((p) => esc(p.n)).join(", ")}</div>` : ""}${hurtOut.length ? `<div class="bad"><b>Hurt, leave out:</b> ${hurtOut.map((p) => `${esc(p.n)} (${esc(backWhen(p))})`).join(", ")}</div>` : ""}${off.length ? `<div><b>No game this night:</b> ${off.map((p) => esc(p.n)).join(", ")}</div>` : ""}${empties >= 3 ? `<div>${empties} starting spots are empty that night. A free agent who plays then is free points: see <button class="linkbtn" data-tab="adds">Pickups → This week</button>.</div>` : ""}</div>
       <p class="note">Goalies only score if they actually start. Starters are usually confirmed the morning of the game: check <a href="https://www.dailyfaceoff.com/starting-goalies/" target="_blank" rel="noopener">Daily Faceoff's starting goalies</a> and bench a goalie who's sitting.</p>
     </div>`;
   }
@@ -1001,14 +996,18 @@ function renderTeam() {
   const todo = [];
   if (night) todo.push(`<li><b>Set your lineup for ${esc(dLabel(night.d, { weekday: "long" }))}.</b> It's worked out for you below. Do it again each game day: only players with a game can score. <button class="linkbtn" data-scroll="tonight">Show me</button></li>`);
   todo.push(`<li id="todoTrade"><b>Trade for help at ${esc(weak.length ? word[weak[0]] : "your weakest spot")}.</b> <span class="note">Looking for fair deals…</span></li>`);
-  const addPick = adds.find((x) => !(x.drop && x.drop !== x.p && analystsBacked(x.drop)));
+  // best pickup whose drop isn't a player the analysts rate much higher (shop those in trades instead); each pickup's
+  // drop options are checked, not just its best one
+  const okOpts = (x) => (x.opts && x.opts.length ? x.opts : [{ g: x.gain, drop: x.drop }]).filter((z) => !(z.drop && z.drop !== x.p && analystsBacked(z.drop)));
+  const addPick = pickups(S.team, "ros").list.map((x) => { const ok = okOpts(x); return ok.length ? { ...x, drop: ok[0].drop, gain: ok[0].g, alt: ok[1] && ok[1].drop !== x.p && ok[1].g >= 5 ? ok[1] : null } : null; })
+    .filter((x) => x && x.gain >= 5).sort((a, b) => b.gain + b.up - (a.gain + a.up))[0];
   const os = pickups(S.team, "ros").os;
   if (addPick && addPick.free) {
     const back = os && os.until ? ` until he's back around ${esc(dLabel(os.until, { month: "short", day: "numeric" }))}` : "";
     const then = addPick.drop && addPick.drop !== addPick.p ? ` When he's back, drop ${esc(addPick.drop.n)}.` : addPick.drop === addPick.p ? ` When he's back, drop ${esc(addPick.p.n)} again.` : "";
     todo.push(`<li><b>Pick up ${esc(addPick.p.n)}</b> (${esc(addPick.p.t)}). ${os && os.who ? `${esc(os.who.n)} is on IR, so you` : "You"} have an open roster spot and don't need to drop anyone${back}.${then} About ${sgn(addPick.gain)} points for the rest of the season. <button class="linkbtn" data-tab="adds">All pickups</button></li>`);
   } else if (addPick) {
-    todo.push(`<li><b>Pick up ${esc(addPick.p.n)}</b> (${esc(addPick.p.t)}) and drop ${esc(addPick.drop.n)}: about ${sgn(addPick.gain)} points for the rest of the season. <button class="linkbtn" data-tab="adds">All pickups</button></li>`);
+    todo.push(`<li><b>Pick up ${esc(addPick.p.n)}</b> (${esc(addPick.p.t)}) and drop ${esc(addPick.drop.n)}: about ${sgn(addPick.gain)} points for the rest of the season.${addPick.alt ? ` Dropping ${esc(addPick.alt.drop.n)} instead: ${sgn(addPick.alt.g)}.` : ""} <button class="linkbtn" data-tab="adds">All pickups</button></li>`);
   }
   const stash = breakouts(S.team)[0];
   if (stash && stash.b >= 0.22) todo.push(`<li><b>Keep an eye on ${esc(stash.p.n)}</b> (${esc(stash.p.t)}): the best ${isVet(stash.p) ? "big-year" : "breakout"} bet on waivers, a ${Math.round(100 * stash.b)}% chance he beats his projection by 30% or more and ends up worth a roster spot (${Math.round(100 * stash.p.bo[1])}% is typical for a player projected like him). Worth a bench spot if you have a weak one. <button class="linkbtn" data-bo="1">Breakout list</button></li>`);
@@ -1018,11 +1017,11 @@ function renderTeam() {
   // injuries go first: they come from the injury report, checked several times a day
   const injTodo = [], irUsed = roster.filter((p) => onIR(p.id)).length;
   for (const p of inj) {
-    const n = missedGames(p), when = esc(dLabel(p.ret, { month: "short", day: "numeric" })), what = esc(injWhat(p).toLowerCase());
+    const n = missedGames(p), bw = esc(backWhen(p)), what = esc(injWhat(p).toLowerCase()), hs = injOf(p) && injOf(p).s === "susp" ? "suspended" : "hurt", wp = hs === "suspended" ? "" : what + ", ";
     const miss = n ? `, misses about ${n} game${n === 1 ? "" : "s"}` : ", shouldn't miss any games";
-    if (onIR(p.id)) injTodo.push(`<li class="bad"><b>${esc(p.n)} is hurt and on your IR</b> (${what}, back around ${when}${miss}). He's left out of your lineups until then.</li>`);
-    else if (n >= 2 && irUsed < IR_SLOTS) injTodo.push(`<li class="bad"><b>Move ${esc(p.n)} to IR in Fantrax</b> (${what}, back around ${when}${miss}). That opens a roster spot, so you can pick someone up without dropping anyone. He's already left out of your lineups here.</li>`);
-    else injTodo.push(`<li class="bad"><b>${esc(p.n)} is hurt</b> (${what}, back around ${when}${miss}). Keep him on your bench until then; he's already left out of your lineups here.</li>`);
+    if (onIR(p.id)) injTodo.push(`<li class="bad"><b>${esc(p.n)} is ${hs} and on your IR</b> (${wp}${bw}${miss}). He's left out of your lineups ${outForSeason(p) ? "all season" : "until then"}.</li>`);
+    else if (n >= 2 && irUsed < IR_SLOTS) injTodo.push(`<li class="bad"><b>Move ${esc(p.n)} to IR in Fantrax</b> (${wp}${bw}${miss}). That opens a roster spot, so you can pick someone up without dropping anyone. He's already left out of your lineups here.</li>`);
+    else injTodo.push(`<li class="bad"><b>${esc(p.n)} is ${hs}</b> (${wp}${bw}${miss}). Keep him on your bench ${outForSeason(p) ? "" : "until then"}; he's already left out of your lineups here.</li>`.replace(" ;", ";"));
   }
   for (const p of roster.filter(dtd)) { const x = injOf(p), n = missedGames(p); injTodo.push(`<li><b>${esc(p.n)} is day-to-day</b>${x.why && x.why !== "Undisclosed" ? ` (${esc(x.why.toLowerCase())})` : ""}. ${n ? `The report expects him to miss about ${n} game${n === 1 ? "" : "s"}, so he's left out of your lineups until ${esc(dLabel(p.ret, { month: "short", day: "numeric" }))}. ` : ""}Check the news before his next game and bench him if he's ruled out.</li>`); }
   const easy = pickups(S.team, "ros").contrib[0];
@@ -1175,6 +1174,8 @@ function renderAdds() {
   { const wn = el.querySelector(".whynot"); if (wn) wn.addEventListener("toggle", () => (S.whyOpen = wn.open)); }
   $("#addList").onclick = (e) => {
     const sh = e.target.closest("[data-shop]"); if (sh) { shopPlayer(sh.dataset.shop); return; }
+    const ds = e.target.closest("[data-dsel]");
+    if (ds) { const [pid, did] = ds.dataset.dsel.split("|"); (S.dropSel || (S.dropSel = {}))[pid] = did; renderAdds(); return; }
     const b = e.target.closest("[data-atoggle],[data-star]"); if (!b) return;
     if (b.dataset.star) { toggleStar(b.dataset.star); renderAdds(); return; }
     S.addOpen = S.addOpen === b.dataset.atoggle ? null : b.dataset.atoggle; renderAdds();
@@ -1218,13 +1219,17 @@ function forYou(x, mode, list) {
   const where = gk ? "" : by.length > 1 ? ` (${by.map(([sl, n]) => `${n} at ${POSNAME[sl].toLowerCase()}`).join(", ")})` : ` at ${POSNAME[by[0][0]].toLowerCase()}`;
   // starts he takes: all of the dropped player's, and whatever the others lose (with an open spot nobody leaves until later)
   const gone = drop && !x.free ? drop : null, n0 = (q) => (st0.get(q.id) ? st0.get(q.id).n : 0), n1 = (q) => (st.get(q.id) ? st.get(q.id).n : 0);
-  const lost = R.map((q) => ({ q, n: q === gone ? n0(q) : n0(q) - n1(q) })).filter((z) => z.n > 0).sort((a, b) => b.n - a.n);
+  const c0 = (q) => (st0.get(q.id) ? st0.get(q.id).cut : 0), c1 = (q) => (st.get(q.id) ? st.get(q.id).cut : 0);
+  const lost = R.map((q) => ({ q, n: q === gone ? n0(q) : n0(q) - n1(q), cut: q !== gone && c1(q) - c0(q) >= 3 })).filter((z) => z.n > 0).sort((a, b) => b.n - a.n);
   const takenN = lost.reduce((t, z) => t + z.n, 0);
-  const took = lost.filter((z) => z.n >= 3).slice(0, 2).map((z, i) => `${esc(lastName(z.q))} (${z.q === gone ? "your drop, " : ""}${z.n}${i && z.q !== gone ? "" : " nights"})`);
+  // a player pushed off the roster (over the 18-player limit once injured players return) isn't "replaced" in the lineup
+  const cutz = lost.find((z) => z.cut && z.n >= 3);
+  const took = lost.filter((z) => z.n >= 3 && !z.cut).slice(0, 2).map((z, i) => `${esc(lastName(z.q))} (${z.q === gone ? "your drop, " : ""}${z.n}${i && z.q !== gone ? "" : " nights"})`);
   let txt = `In your lineup about <b>${o.n}</b> of his ${gk ? "team's " : ""}${o.games} games${mode === "week" ? " this week" : ""}${where}`;
   txt += took.length ? `, mostly in place of ${took.join(" and ")}` : "";
   txt += o.n - takenN >= 3 ? `${took.length ? ", plus" : ","} filling ${o.n - takenN} nights your lineup has an empty spot now` : "";
   txt += ".";
+  if (cutz) txt += ` Keeping him means you're over the 18-player limit once your injured players are back, so ${esc(cutz.q.n)} would be the one to cut (he'd lose ${cutz.n} nights).`;
   const v = valOf(p), vs = valSlot(p);
   if (v != null && v < -1 && !gk) {
     const flex = by.length > 1 && by[1][1] >= 0.2 * o.n;
@@ -1263,18 +1268,55 @@ function whyNotTop(top, tx, vs, R, days, st0) {
   if (main) return `${pre} he'd mostly take ${esc(lastName(main.q))}'s nights, and ${esc(lastName(main.q))} scores about as much a game (${fmt(rateAt(main.q, vs), 1)} vs ${fmt(rateAt(top, vs), 1)}). ${end}`;
   return `${pre} ${end}`;
 }
-function addCard(x, rank, mode, list) {
+// Drop options on a pickup card: every drop candidate with what it does (best first). The one the manager taps
+// drives the big number, the tags and the "in your lineup" line.
+function chosenOpt(x) {
+  const sel = S.dropSel || (S.dropSel = {}), id = sel[x.p.id];
+  return (id && x.opts.find((o) => o.drop && o.drop.id === id)) || x.opts[0] || { g: x.gain, drop: x.drop, dc: x.dropC };
+}
+// next season: how the best 7 keepers change if he comes in and d goes (dropping him again later changes nothing)
+function optNext(p, d) {
+  if (!d || d === p) return 0;
+  const R = rosterOf(S.team);
+  return keeperSet(R.filter((q) => q !== d).concat([p])).v - keeperSet(R).v;
+}
+// in "This week" mode: what a swap does over the rest of the season
+function optRos(x, o) {
+  const res = pickups(S.team, "week");
+  return memo("optros|" + rosterKey(S.team) + "|" + fromDay() + "|" + x.p.id + "|" + (o.drop ? o.drop.id : "-"), () => {
+    const R = rosterOf(S.team), p = x.p;
+    if (res.os) {
+      const b = res.rosBases, g1 = b.pre.length ? rangeValue(R.concat([p]), b.pre) - b.preV : 0;
+      if (!b.post.length || !o.drop || o.drop === p) return g1;
+      return g1 + rangeValue(R.filter((q) => q !== o.drop).concat([p]), b.post) - b.postV;
+    }
+    return rangeValue(R.filter((q) => q !== o.drop).concat([p]), res.rosDays) - res.baseRos;
+  });
+}
+function dropOptsHTML(x, o, mode) {
+  const p = x.p;
+  if (!x.opts || x.opts.length < 2) return "";
+  const btn = (z) => {
+    const nx = optNext(p, z.drop), ros = mode === "week" ? optRos(x, z) : null, again = z.drop === p;
+    const title = `${again ? "Pick him up now and drop him again when your IR player is back" : `Drop ${z.drop.n}`}: ${sgn(z.g)} ${mode === "week" ? "this week" : "over the rest of the season"}${ros != null ? `, ${sgn(ros)} over the rest of the season` : ""}${Math.abs(nx) >= 1 ? `, ${sgn(nx)} to your best 7 keepers next season` : ""}${!again && analystsBacked(z.drop) ? ". Analysts rank him much higher than our stats do, so try trading him first" : ""}.`;
+    return `<button class="dopt" data-dsel="${esc(p.id)}|${esc(z.drop.id)}" aria-pressed="${z === o}" title="${esc(title)}">${esc(again ? "him again" : lastName(z.drop))} <b>${sgn(z.g)}</b>${ros != null ? ` <small>season ${sgn(ros)}</small>` : ""}${Math.abs(nx) >= 3 ? ` <small class="${nx < 0 ? "neg" : "pos"}">next yr ${sgn(nx)}</small>` : ""}</button>`;
+  };
+  return `<div class="dopts" role="group" aria-label="Who to drop"><span class="dl">${x.free ? "When he's back, drop" : "Drop"}:</span>${x.opts.map(btn).join("")}</div>`;
+}
+function addCard(x0, rank, mode, list) {
+  const o = chosenOpt(x0), x = { ...x0, drop: o.drop, gain: o.g, dropC: o.dc };
   const p = x.p, open = S.addOpen === p.id;
   const tags = [];
   if (x.free) {
     const os = pickups(S.team, "ros").os;
     tags.push(`<span class="tag good" title="You have an open roster spot">No drop needed${os && os.who ? ` until ${esc(os.who.n.split(" ").slice(-1)[0])} is back` : ""}</span>`);
-    if (x.drop && x.drop !== p) tags.push(`<span class="tag">Then drop <b>${esc(x.drop.n)}</b></span>`);
+    if (x0.opts.length >= 2) { /* the options row says who */ }
+    else if (x.drop && x.drop !== p) tags.push(`<span class="tag">Then drop <b>${esc(x.drop.n)}</b></span>`);
     else if (x.drop === p) tags.push(`<span class="tag" title="Once the roster is full again he isn't better than anyone you have">Then drop him again</span>`);
-  } else tags.push(`<span class="tag">Drop <b>${esc(x.drop.n)}</b></span>`);
+  } else if (x0.opts.length < 2) tags.push(`<span class="tag">Drop <b>${esc(x.drop.n)}</b></span>`);
   if (x.drop && x.drop !== p && analystsBacked(x.drop)) tags.push(`<button class="pill gold pbtn" data-shop="${esc(x.drop.id)}" title="Analysts rank him much higher than our stats do">Analysts like ${esc(x.drop.n.split(" ").slice(-1)[0])}: find a trade first →</button>`);
   tags.push(`<span class="tag">${x.games} game${x.games === 1 ? "" : "s"} ${mode === "week" ? "this week" : "left"}</span>`);
-  if (x.rosDelta != null) tags.push(`<span class="tag ${x.rosDelta >= 0 ? "good" : "bad"}" title="What this swap does to your team over the whole rest of the season">Rest of season <b>${sgn(x.rosDelta)}</b></span>`);
+  { const rd = mode === "week" && x.drop !== undefined && x0.opts.length ? optRos(x0, o) : x.rosDelta; if (rd != null) tags.push(`<span class="tag ${rd >= 0 ? "good" : "bad"}" title="What this swap does to your team over the whole rest of the season">Rest of season <b>${sgn(rd)}</b></span>`); }
   { const it = injTag(p); if (it) tags.push(it); }
   if (p.rk) tags.push(`<span class="pill gold">Rookie</span>`);
   if (p.mr && p.orank && p.mr + 8 <= p.orank) tags.push(`<span class="pill good" title="Analysts rank him higher than our stats do">Analysts like him</span>`);
@@ -1291,6 +1333,7 @@ function addCard(x, rank, mode, list) {
       <div class="bigpts"><div class="p gainv">${sgn(x.gain)}</div><div class="l">pts ${mode === "week" ? "this wk" : "gained"}</div></div>
     </button>
     <div class="subrow">${tags.join("")}</div>
+    ${dropOptsHTML(x0, o, mode)}
     ${fy ? `<ul class="why bwhy"><li class="info">${fy}</li></ul>` : ""}
     ${open ? detailHTML(p) : ""}
   </div>`;
@@ -1807,7 +1850,7 @@ function detailHTML(p) {
   const lv = liveOf(p);
   if (lv && lv.n) lead += `<li class="info">This season so far: ${lv.n} game${lv.n === 1 ? "" : "s"}, ${fmt(lv.fp)} fantasy points${lv.toi ? `, ${fmt(lv.toi, 1)} min a game` : ""}${lv.pp ? ` (${fmt(lv.pp, 1)} on the power play)` : ""}. His projection has moved ${sgn(100 * ((liveMult(p) || 1) - 1))}% since the season started.</li>`;
   const ij = injOf(p);
-  if (hurt(p) || dtd(p)) lead = `<li class="bad">${esc(injWhat(p))}${hurt(p) && !(dtd(p) && !missedGames(p)) ? `: expected back around <b>${esc(dLabel(p.ret, { month: "short", day: "numeric" }))}</b>${missedGames(p) ? `, so he misses about ${missedGames(p)} of his team's games` : ""}` : ": he might miss a game"}.${ij ? ` From ESPN's NHL injury report (${esc(dLabel(ij.d, { month: "short", day: "numeric" }))}), checked several times a day; every projection on this site already counts it.` : ""}</li>` + lead;
+  if (hurt(p) || dtd(p)) lead = `<li class="bad">${esc(injWhat(p))}${hurt(p) && !(dtd(p) && !missedGames(p)) ? `: ${outForSeason(p) ? "<b>out for the season</b>" : `expected back around <b>${esc(dLabel(p.ret, { month: "short", day: "numeric" }))}</b>`}${missedGames(p) ? `, so he misses about ${missedGames(p)} of his team's games` : ""}` : ": he might miss a game"}.${ij ? ` From ESPN's NHL injury report (${esc(dLabel(ij.d, { month: "short", day: "numeric" }))}), checked several times a day; every projection on this site already counts it.` : ""}</li>` + lead;
   if (!p.unknown && p.gm > 0 && owners()[p.id]) {
     const ow = owners()[p.id], st = lineupStarts(rosterOf(ow), rosDays()).get(p.id);
     if (st && st.games) lead += `<li class="info">${st.cut >= st.games * 0.9 ? (ow === S.team ? `When ${esc(backNames(ow))} ${backNames(ow).includes(" and ") ? "come" : "comes"} back you'll be over the 18-player limit, and he's the player your lineup would miss least, so he's the one to drop or trade.` : `${esc(tname(ow))} will be over the roster limit once its injured players return, and he's the player it would miss least, so he'd likely be cut.`) : `In ${ow === S.team ? "your" : esc(tname(ow)) + "'s"} lineup about <b>${st.n}</b> of his ${st.games} remaining games (${Math.round(st.pts)} points); the other nights he'd sit behind better players at his position.`}</li>`;
