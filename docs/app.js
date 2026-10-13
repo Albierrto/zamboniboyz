@@ -673,23 +673,25 @@ const HOR = {
   next: { w: 1, label: "Next season", tip: "Next season counts as much as this one: for building a keeper core with young players and picks." },
 };
 function horW() { return (HOR[S.hor] || HOR.both).w; }
-function ageF(p) {
-  const a = p.age || 28, K = META.keeperAge || {};
+function ageF(p) { return ageFAt(p, p.age || 28); }
+// the same one-year age factor at any age (the season after next applies it twice: rougher)
+function ageFAt(p, a) {
+  const K = META.keeperAge || {};
   if (p.slot === "G") { const g = K.goalie || {}; return a <= 25 ? g["<=25"] ?? 1 : a <= 28 ? g["26-28"] ?? 0.9 : a <= 31 ? g["29-31"] ?? 0.9 : a <= 34 ? g["32-34"] ?? 0.75 : g["35+"] ?? 0.6; }
   const c = K.coef || [0, 0, 1], x = Math.min(37, Math.max(19, a));
   return Math.min(1.1, Math.max(0.6, c[0] * x * x + c[1] * x + c[2]));
 }
 // next season's points above waiver level if he plays slot s
-function nextAt(p, s) { return rateAt(p, s) * 82 * ageF(p) - (REPL[s] || 0); }
+function nextAt(p, s, yr) { const a = p.age || 28, f = yr === 2 ? ageFAt(p, a) * ageFAt(p, a + 1) : ageFAt(p, a); return rateAt(p, s) * 82 * f - (REPL[s] || 0); }
 function nextVal(p) { return p.unknown ? 0 : Math.max(0, ...elig(p).map((s) => nextAt(p, s))); }
 // the keeper group a roster would carry into next season: 1 C, 2 W, 2 D, 1 G + 1 extra skater, best total
-function keeperSet(list) {
-  return memo("k|" + (MKT.on ? "m|" : "") + list.map((p) => p.id).sort().join(","), () => {
+function keeperSet(list, yr) {
+  return memo("k|" + (yr === 2 ? "y2|" : "") + (MKT.on ? "m|" : "") + list.map((p) => p.id).sort().join(","), () => {
     const out = { v: 0, keep: new Map() };
-    const gs = list.filter((p) => p.slot === "G").map((p) => ({ p, v: Math.max(0, nextAt(p, "G")) })).sort((a, b) => b.v - a.v);
+    const gs = list.filter((p) => p.slot === "G").map((p) => ({ p, v: Math.max(0, nextAt(p, "G", yr)) })).sort((a, b) => b.v - a.v);
     if (gs[0]) { out.v += gs[0].v; out.keep.set(gs[0].p.id, "G"); }
     const sk = list.filter((p) => p.slot !== "G" && !p.unknown).map((p) => {
-      const e = elig(p), o = { p, C: e.includes("C") ? Math.max(0, nextAt(p, "C")) : -1, W: e.includes("W") ? Math.max(0, nextAt(p, "W")) : -1, D: e.includes("D") ? Math.max(0, nextAt(p, "D")) : -1 };
+      const e = elig(p), o = { p, C: e.includes("C") ? Math.max(0, nextAt(p, "C", yr)) : -1, W: e.includes("W") ? Math.max(0, nextAt(p, "W", yr)) : -1, D: e.includes("D") ? Math.max(0, nextAt(p, "D", yr)) : -1 };
       o.X = Math.max(o.C, o.W, o.D); return o;
     }).sort((a, b) => b.X - a.X).slice(0, 16);
     const NS = 36, ix = (c, w, d, x) => ((c * 3 + w) * 3 + d) * 2 + x;
@@ -1174,6 +1176,8 @@ function renderAdds() {
   { const wn = el.querySelector(".whynot"); if (wn) wn.addEventListener("toggle", () => (S.whyOpen = wn.open)); }
   $("#addList").onclick = (e) => {
     const sh = e.target.closest("[data-shop]"); if (sh) { shopPlayer(sh.dataset.shop); return; }
+    const sm = e.target.closest(".dcmp > summary");
+    if (sm) { e.preventDefault(); const id = sm.parentElement.dataset.dcmp, m = S.dcmp || (S.dcmp = {}); m[id] = !m[id]; renderAdds(); return; }
     const ds = e.target.closest("[data-dsel]");
     if (ds) { const [pid, did] = ds.dataset.dsel.split("|"); (S.dropSel || (S.dropSel = {}))[pid] = did; renderAdds(); return; }
     const b = e.target.closest("[data-atoggle],[data-star]"); if (!b) return;
@@ -1293,6 +1297,68 @@ function optRos(x, o) {
     return rangeValue(R.filter((q) => q !== o.drop).concat([p]), res.rosDays) - res.baseRos;
   });
 }
+// Why each drop option comes out the way it does: a ledger of every player whose points change (the pickup's nights,
+// the dropped player's nights, teammates who sit more or less, and anyone pushed off the roster once injured players
+// return), plus what it does to your best 7 keepers next season and the season after.
+function dropLedger(x, z, mode) {
+  const res = pickups(S.team, mode), R = rosterOf(S.team), p = x.p, days = res.days, os = res.os;
+  return memo("ledger|" + mode + "|" + rosterKey(S.team) + "|" + fromDay() + "|" + p.id + "|" + (z.drop ? z.drop.id : "-"), () => {
+    const segs = [];
+    if (os) {
+      const pre = days.filter((d) => !os.until || d.d < os.until), post = os.until ? days.filter((d) => d.d >= os.until) : [];
+      if (pre.length) segs.push([R.concat([p]), pre]);
+      if (post.length && z.drop && z.drop !== p) segs.push([R.filter((q) => q !== z.drop).concat([p]), post]);
+    } else segs.push([R.filter((q) => q !== z.drop).concat([p]), days]);
+    const L = new Map(), add = (q, k, v) => { const e = L.get(q.id) || { q, n: 0, pts: 0, cut: 0 }; e[k] += v; L.set(q.id, e); };
+    for (const [R2, ds] of segs) {
+      const a = lineupStarts(R, ds), b = lineupStarts(R2, ds);
+      for (const q of new Set(R.concat(R2))) {
+        const A = a.get(q.id) || { n: 0, pts: 0, cut: 0 }, B = b.get(q.id) || { n: 0, pts: 0, cut: 0 };
+        add(q, "n", B.n - A.n); add(q, "pts", B.pts - A.pts); add(q, "cut", (B.cut || 0) - (A.cut || 0));
+      }
+    }
+    const before = lineupStarts(R, days);
+    const rows = [...L.values()].filter((e) => Math.abs(e.pts) >= 1.5 || e.q === p || e.q === z.drop).sort((a, b) => (b.q === p) - (a.q === p) || (b.q === z.drop) - (a.q === z.drop) || Math.abs(b.pts) - Math.abs(a.pts));
+    const gone = z.drop && z.drop !== p ? z.drop : null, R2 = gone ? R.filter((q) => q !== gone).concat([p]) : R;
+    const k0 = keeperSet(R), k1 = keeperSet(R2), j0 = keeperSet(R, 2), j1 = keeperSet(R2, 2);
+    return { rows, before, ny: k1.v - k0.v, ny2: j1.v - j0.v, kin: [...k1.keep.keys()].filter((id) => !k0.keep.has(id)), kout: [...k0.keep.keys()].filter((id) => !k1.keep.has(id)) };
+  });
+}
+function ledgerText(x, z, mode) {
+  const p = x.p, Lg = dropLedger(x, z, mode), d = z.drop && z.drop !== x.p ? z.drop : null, parts = [];
+  const nm = (q) => esc(lastName(q)), wk = mode === "week" ? " this week" : "";
+  for (const e of Lg.rows) {
+    const v = `<b>${sgn(e.pts)}</b>`;
+    if (e.q === p) parts.push(`${v} ${nm(p)} plays ${e.n} of his games${wk} for you`);
+    else if (e.q === d) {
+      const b = Lg.before.get(d.id);
+      parts.push(b && b.n ? `${v} ${nm(d)}'s ${-e.n} nights${wk} are gone` : `${nm(d)} wasn't playing for you${wk}${b && b.cut >= 3 ? " (he was already the one to cut once your injured players are back, so you'll still be a player over then)" : ""}`);
+    } else if (e.cut >= 3 && e.pts < 0) parts.push(`${v} ${nm(e.q)} would have to be cut once your injured players are back`);
+    else if (e.pts < 0) parts.push(`${v} ${nm(e.q)} sits ${-e.n} more night${e.n === -1 ? "" : "s"}`);
+    else parts.push(`${v} ${nm(e.q)} plays ${e.n} more night${e.n === 1 ? "" : "s"}`);
+  }
+  let t = `<ul class="lg">${parts.map((x) => `<li>${x}</li>`).join("")}</ul>`;
+  if (d && analystsBacked(d)) t += ` Analysts rate ${nm(d)} much higher than our numbers do, so try trading him first.`;
+  const name = (id) => { const q = PL.get(id); return q ? esc(lastName(q)) : "?"; };
+  if (Lg.kout.length || Lg.kin.length) t += ` Keepers: ${Lg.kin.length ? `${Lg.kin.map(name).join(", ")} would join your best 7` : ""}${Lg.kin.length && Lg.kout.length ? " in place of " : ""}${Lg.kout.length ? `${Lg.kout.map(name).join(", ")}${Lg.kin.length ? "" : " would drop out of your best 7"}` : ""}.`;
+  else t += ` Your best 7 keepers don't change.`;
+  return t;
+}
+function dropCompareHTML(x, o, mode) {
+  if (!x.opts || x.opts.length < 2) return "";
+  const open = !!(S.dcmp && S.dcmp[x.p.id]);
+  let body = "";
+  if (open) {
+    body = x.opts.map((z) => {
+      const Lg = dropLedger(x, z, mode), again = z.drop === x.p, ros = mode === "week" ? optRos(x, z) : null;
+      const cell = (lab, v, tip) => `<span class="dnum${v >= 0.5 ? " up" : v <= -0.5 ? " dn" : ""}" title="${esc(tip)}"><small>${lab}</small><b>${sgn(v)}</b></span>`;
+      return `<li class="${z === o ? "on" : ""}"><div class="dhead"><b>${again ? "Drop him again later" : `Drop ${esc(z.drop.n)}`}</b>${z === x.opts[0] ? ` <span class="pill good">best now</span>` : ""}</div>
+        <div class="dnums">${cell(mode === "week" ? "This week" : "This season", z.g, "Points your lineup gains over the time frame you picked")}${ros != null ? cell("Rest of season", ros, "Over the whole rest of the season") : ""}${cell("Next season", Lg.ny, "Change in your best 7 keepers' points above waiver level next season")}${cell("Season after", Lg.ny2, "Same for the season after next, aging him two years: rougher")}</div>
+        <div class="lgx">${ledgerText(x, z, mode)}</div></li>`;
+    }).join("");
+  }
+  return `<details class="dcmp"${open ? " open" : ""} data-dcmp="${esc(x.p.id)}"><summary>Why these numbers? Compare the drops${mode === "week" ? "" : " (this season, next season, the season after)"}</summary>${open ? `<ul>${body}</ul><p class="note">Next season and the season after count only your best 7 keepers (1 C, 2 W, 2 D, 1 G, 1 more skater), as points above waiver level. The season after is rougher: it ages everyone two years.</p>` : ""}</details>`;
+}
 function dropOptsHTML(x, o, mode) {
   const p = x.p;
   if (!x.opts || x.opts.length < 2) return "";
@@ -1334,6 +1400,7 @@ function addCard(x0, rank, mode, list) {
     </button>
     <div class="subrow">${tags.join("")}</div>
     ${dropOptsHTML(x0, o, mode)}
+    ${dropCompareHTML(x0, o, mode)}
     ${fy ? `<ul class="why bwhy"><li class="info">${fy}</li></ul>` : ""}
     ${open ? detailHTML(p) : ""}
   </div>`;
