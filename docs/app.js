@@ -255,30 +255,85 @@ function applyInjuries() {
   }
   buildGoalieBoost();
 }
-// a goalie hurt after the preseason build: on the nights he's out, his starts go to his healthy teammates
+// A goalie hurt after the preseason build: on the nights he's out, his share of starts is split among his healthy
+// teammates on the board and whoever else the team calls up (weight GX0 for "someone not on the board"), weighted by
+// their normal shares. That guess is then corrected by who has actually started since he went down (live.json "gst":
+// every team's starting goalie game by game, call-ups included), counting the guess as GP games. Each goalie is only
+// judged on games he was healthy for. So a third-stringer doesn't inherit a starter's job unless he's really starting.
+const GX0 = 0.08, GP = 4;
 let GBM = new Map();
 function buildGoalieBoost() {
   GBM = new Map();
-  const byTeam = {};
+  const byTeam = {}, GST = (LIVE && LIVE.gst) || {};
   for (const p of B.players) if (p.slot === "G" && p.t && p.gm > 0 && p.gs > 0) (byTeam[p.t] = byTeam[p.t] || []).push(p);
   const t0 = todayET();
   for (const [t, gs] of Object.entries(byTeam)) {
     const late = gs.filter((g) => g.ret && (!g.ret0 || g.ret > g.ret0));
     if (!late.length) continue;
+    // evidence: this team's games after the last start by any of the hurt goalies
+    const lateP = new Set(late.map((g) => g.pid).filter(Boolean)), games = GST[t] || [];
+    let i0 = 0; games.forEach((g, i) => { if (lateP.has(g[1])) i0 = i + 1; });
+    const ev = games.slice(i0);
     for (const day of DAYS) {
       if (day.d < t0 || !day.teams.has(t)) continue;
       const lost = late.filter((g) => day.d < g.ret && (!g.ret0 || day.d >= g.ret0)).reduce((a, g) => a + g.gs / g.gm, 0);
       if (!lost) continue;
       const healthy = gs.filter((q) => plays(q, day));
       const tot = healthy.reduce((a, q) => a + q.gs / q.gm, 0);
-      if (!tot) continue;
       for (const q of healthy) {
-        const sh = q.gs / q.gm, nsh = Math.min(0.9, sh + (lost * sh) / tot);
+        const sh = q.gs / q.gm, guess = Math.min(0.9, sh + (lost * sh) / (tot + GX0));
+        const seen = ev.filter((g) => !(q.ret && g[0] < q.ret)), c = seen.filter((g) => g[1] === q.pid).length;
+        const nsh = Math.min(0.9, (GP * guess + c) / (GP + seen.length));
         if (!GBM.has(q.id)) GBM.set(q.id, new Map());
         GBM.get(q.id).set(day.d, nsh / sh);
       }
     }
   }
+}
+// goalies starting for an NHL team who aren't in this site's player list (call-ups): started 2+ of the team's last
+// 8 games and at least 40% of them
+function offBoardStarters() {
+  const GST = (LIVE && LIVE.gst) || {}, NM = (LIVE && LIVE.gnm) || {}, onBoard = new Set(B.players.filter((p) => p.pid).map((p) => p.pid)), out = [];
+  for (const [t, games] of Object.entries(GST)) {
+    const last = games.slice(-8), cnt = {};
+    for (const g of last) if (!onBoard.has(g[1])) cnt[g[1]] = (cnt[g[1]] || 0) + 1;
+    for (const [pid, c] of Object.entries(cnt)) if (c >= 2 && c / last.length >= 0.4) out.push({ t, pid: +pid, n: NM[pid] || "Unknown goalie", c, of: last.length, streak: (() => { let k = 0; for (let i = games.length - 1; i >= 0 && games[i][1] === +pid; i--) k++; return k; })() });
+  }
+  return out.sort((a, b) => b.c / b.of - a.c / a.of);
+}
+// rough points per start for a goalie the site has no projection for: the median of the board's backups (10 to 35 projected starts)
+function backupPPS() {
+  const x = B.players.filter((p) => p.slot === "G" && p.gs >= 10 && p.gs <= 35 && p.pts > 0).map((p) => p.pts / p.gs).sort((a, b) => a - b);
+  return x.length ? x[Math.floor(x.length / 2)] : 2;
+}
+// his Fantrax id (to see who owns him), matched by name and team in Fantrax's player list
+function fxIdByName(name, team) {
+  if (!EXTRA) return null;
+  const k = fold(name).replace(/[^a-z ]/g, "").trim();
+  let hit = null;
+  for (const [id, x] of Object.entries(EXTRA)) {
+    if (!x || !x.name) continue;
+    const nm = fold(x.name.includes(", ") ? x.name.split(", ").reverse().join(" ") : x.name).replace(/[^a-z ]/g, "").trim();
+    if (nm === k) { if (x.team === team) return id; hit = hit || id; }
+  }
+  return hit;
+}
+function offBoardBanner(mode) {
+  const list = offBoardStarters();
+  if (!list.length) return "";
+  if (!EXTRA) { loadExtra(); }
+  if (!EXTRA) return "";
+  const pps = backupPPS(), own = owners();
+  // only the ones you could actually get (free agents), or your own
+  const avail = list.map((x) => { const fid = fxIdByName(x.n, x.t); return { ...x, fid, ow: fid ? own[fid] || null : null }; }).filter((x) => x.fid && (!x.ow || x.ow === S.team));
+  if (!avail.length) return "";
+  const items = avail.slice(0, 4).map((x) => {
+    const ow = x.ow, share = x.c / x.of;
+    const left = DAYS.filter((d) => d.d >= fromDay() && d.teams.has(x.t)).length, wk = windowDays("week").filter((d) => d.teams.has(x.t)).length;
+    const est = pps * share * (mode === "week" ? wk : left);
+    return `<li><b>${esc(x.n)}</b> (${esc(x.t)}) has started ${x.c} of his team's last ${x.of} games${x.streak >= 2 ? `, including the last ${x.streak}` : ""}. ${ow ? "He's on your team." : "<b>He's a free agent.</b>"} If he keeps that share, a rough guess is about <b>${Math.round(est)}</b> points ${mode === "week" ? "this week" : "over the rest of the season"} (using a typical backup's ${fmt(pps, 1)} points a start).</li>`;
+  }).join("");
+  return `<div class="banner soft offg"><b>Starting goalies this site can't project.</b> They're not in its player list (usually call-ups), so they're not in the list below. Worth a look in Fantrax:<ul>${items}</ul></div>`;
 }
 function gMult(p, day) { const m = GBM.get(p.id); return (m && day && m.get(day.d)) || 1; }
 function rateOn(p, s, day) { return s === "G" ? rateAt(p, s) * gMult(p, day) : rateAt(p, s); }
@@ -1167,6 +1222,7 @@ function renderAdds() {
     </div>
     ${res.os ? `<div class="banner"><b>You have an open roster spot</b>${res.os.who ? ` because ${esc(res.os.who.n)} is on IR` : ""}, so your next pickup doesn't need a drop${res.os.until ? ` until he's back (around ${esc(dLabel(res.os.until, { month: "short", day: "numeric" }))}). After that you'll have to drop someone, and the points below already count that` : ""}.</div>` : ""}
     <div class="banner soft"><b>Easiest to drop right now:</b> ${drops.map((d) => `${esc(d.p.n)} (adds ${fmt(d.c)})`).join(", ")}. That's how many points each adds to your lineup over the rest of the season once your other players are counted, so these are the only players suggested as drops.</div>
+    ${S.addPos === "ALL" || S.addPos === "G" ? offBoardBanner(mode) : ""}
     ${mode === "ros" ? notTopBanner(res, good) : ""}
     <div class="list" id="addList">${good.slice(0, S.addShow).map((x, i) => addCard(x, i + 1, mode, res.list)).join("") || `<div class="empty">No free agent beats your current roster ${mode === "week" ? "this week" : "right now"}. Check back as news comes in.</div>`}</div>
     <button class="more" id="addMore" ${good.length > S.addShow ? "" : "hidden"}>Show more</button>`;
@@ -2147,6 +2203,7 @@ function renderHow() {
     <li><b>Age:</b> unlike baseball, veterans do this about as often as young players (${Math.round(100 * META.breakout.test.age.rate_old)}% of players 30 and up vs ${Math.round(100 * META.breakout.test.age.rate_young)}% of younger ones in that range), because a hockey season swings a lot with linemates, assists, plus/minus and games played. What differs is what it means. Younger players usually got there with a bigger job (${Math.round(100 * META.breakout.test.age.role_young)}% gained 1.5+ minutes a night or more power-play time, vs ${Math.round(100 * META.breakout.test.age.role_old)}% of veterans), and veterans kept less of it the next season (${Math.round(100 * META.breakout.test.age.keep_old)}% vs ${Math.round(100 * META.breakout.test.age.keep_young)}%). So for players 30 and up the site calls it a <b>big year</b>: worth a pickup, not a keeper price.</li>
     <li><b>Once games start</b>, a refresh job pulls this season's stats from the NHL several times a day and moves every projection. How fast depends on the stat, tested on five past seasons: faceoffs and hits settle within a couple of weeks; goals barely count early because hot shooting streaks don't last. More ice time or a bigger power-play role adds on top. Breakout chances move with it: in testing, about 10 games in, players the update put at 40% or more broke out ${Math.round(100 * META.breakout.test.ins.g10.flag)}% of the time (${Math.round(100 * META.breakout.test.ins.g20.flag)}% by 20 games), while simply chasing a hot start (scoring 30% above his projection) worked ${Math.round(100 * META.breakout.test.ins.g10.hot)}% of the time (${Math.round(100 * META.breakout.test.ins.g20.hot)}% by 20 games).</li>
     <li><b>Pickups</b> give a small bonus for breakout upside (a quarter of the extra points a breakout usually brings, since you can drop him if it doesn't happen), so between two similar free agents the one with more upside ranks first.</li>
+    <li><b>Hurt goalies:</b> when a goalie gets hurt during the season, his starts are split among his healthy teammates and whoever the team calls up, then checked against who has actually started since (the refresh job records every team's starting goalie, game by game). So a third-stringer doesn't inherit a starter's job unless he's really getting the starts. Call-ups who are starting but aren't in this site's player list show up at the top of Pickups if they're free agents.</li>
     <li><b>Not playing lately</b> means his team played 3 or more games in the last 10 days and he didn't play: usually an injury or healthy scratch.</li>
   </ul>
   <h3>Words you'll see</h3>
@@ -2333,8 +2390,11 @@ async function loadLive() {
 setInterval(loadLive, 30 * 60 * 1000);
 let liveAt = 0;
 document.addEventListener("visibilitychange", () => { if (!document.hidden && Date.now() - liveAt > 10 * 60 * 1000) loadLive(); });
+let extraLoading = false;
 async function loadExtra() {
-  try { EXTRA = await fx("getPlayerIds", "sport=NHL"); S.lastSig = ""; afterSync(); } catch (e) { /* names only */ }
+  if (extraLoading || EXTRA) return;
+  extraLoading = true;
+  try { EXTRA = await fx("getPlayerIds", "sport=NHL"); S.lastSig = ""; afterSync(); } catch (e) { /* names only */ } finally { extraLoading = false; }
 }
 function afterSync() {
   renderStrip();
