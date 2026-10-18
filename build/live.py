@@ -9,6 +9,9 @@ build/inseason_goalies.py): each stat's projection is worth K games of evidence,
 stats (faceoffs, hits) move quickly and goals barely move early. Ice-time and power-play-time changes
 add a little on top. Goalies: starts share and points per start update the same way.
 
+Goalie starts: every team's starting goalie game by game for the last 30 days ("gst", with names in "gnm"), call-ups
+included, so the site can tell who is actually starting when a team's goalies are hurt.
+
 Injuries: every run (before the season too) it reads ESPN's public NHL injury report and writes each
 listed player's status, expected return date and body part into live.json ("inj"). Only those facts
 are kept, never the report's write-ups. Players from the preseason news list who have since played
@@ -70,6 +73,28 @@ def nhl(kind, report, d0=None, d1=None):
     d = get(url)
     time.sleep(1.5)
     return {r["playerId"]: r for r in d.get("data", [])}
+
+
+def goalie_starts(today, thru=None):
+    """Every team's starting goalie, game by game, for the last 30 days, including call-ups who aren't on the board
+    (the site uses it to split a hurt goalie's starts among whoever is actually starting). Returns
+    ({team: [[date, nhlId], ...]}, {nhlId: name})."""
+    hi = thru or (today - dt.timedelta(days=1)).isoformat()
+    lo = (dt.date.fromisoformat(hi) - dt.timedelta(days=29)).isoformat()
+    exp = f'seasonId={SEASON} and gameTypeId=2 and gameDate>="{lo}" and gameDate<="{hi}"'
+    url = ("https://api.nhle.com/stats/rest/en/goalie/summary?isAggregate=false&isGame=true&limit=-1&start=0"
+           f"&cayenneExp={urllib.parse.quote(exp)}")
+    rows = get(url).get("data", [])
+    time.sleep(1.5)
+    by, names = {}, {}
+    for r in rows:
+        if not r.get("gamesStarted") or not r.get("teamAbbrev"):
+            continue
+        by.setdefault(r["teamAbbrev"], []).append([str(r["gameDate"])[:10], r["playerId"]])
+        names[str(r["playerId"])] = r.get("goalieFullName") or ""
+    for t in by:
+        by[t].sort()
+    return by, names
 
 
 def norm(s):
@@ -163,6 +188,11 @@ def main():
     recent = nhl("skater", "summary", r_lo, r_hi)
     gsum = nhl("goalie", "summary", None, s_hi); grecent = nhl("goalie", "summary", r_lo, r_hi)
     out["started"] = bool(summ)
+    try:
+        out["gst"], out["gnm"] = goalie_starts(today, thru)
+        print(f"goalie starts: {sum(len(v) for v in out['gst'].values())} games, {len(out['gnm'])} goalies")
+    except Exception as e:  # optional: the site falls back to preseason start shares
+        print("goalie starts skipped:", e)
     # NHL id -> board player (by NHL id; rookies without one by name)
     byname = {}
     for pid, r in list(summ.items()) + list(gsum.items()):
