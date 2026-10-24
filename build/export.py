@@ -372,6 +372,10 @@ import os; os.makedirs("site/data", exist_ok=True)
 # keeper-league facts for the trade tools (next-season aging, pick values, league rules)
 sys.path.insert(0, "build")
 import keepers_meta as KM
+# backup goalies: turn the calibration's extra points into extra starts so points per start stay realistic
+import goalie_starts_fix as GSF
+_gchg, _gmed = GSF.fix(players)
+meta["goalieStartsFix"] = dict(median_pps=round(_gmed, 2), k=GSF.K, over=GSF.OVER, n=len(_gchg))
 meta.update(KM.build(players))
 with open("site/data/board.js", "w") as f:
     f.write("window.BOARD=" + json.dumps(dict(meta=meta, players=players), separators=(",", ":"), ensure_ascii=False) + ";\n")
