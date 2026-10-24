@@ -478,7 +478,15 @@ function rosterOrder(roster) {
   let R = ORD.get(key);
   if (R) return R;
   const byKeep = (a, b) => b[1] - a[1] || (a[0].id < b[0].id ? -1 : 1);
-  if (!CAPX.off && roster.length > META.roster.max && overLimit(roster, rosDays())) R = roster.map((p) => [p, msOf(p)]).sort(byKeep).map((x) => x[0]);
+  if (!CAPX.off && roster.length > META.roster.max && overLimit(roster, rosDays())) {
+    // the roster's own team is whoever owns most of it. Players coming in (a trade or a pickup) count as kept, like a
+    // free agent: a team trades for someone to play him, so its cuts come from its own players. Before this, a
+    // traded-in player was ranked by how useful he was on his OLD team, so a starter buried on a deep roster got cut.
+    const own = owners(), cnt = {};
+    for (const p of roster) { const o = own[p.id]; if (o) cnt[o] = (cnt[o] || 0) + 1; }
+    const home = Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a])[0];
+    R = roster.map((p) => [p, own[p.id] === home ? msOf(p) : Infinity]).sort(byKeep).map((x) => x[0]);
+  }
   else R = roster.map((p) => [p, keepVal(p)]).sort(byKeep).map((x) => x[0]);
   if (ORD.size > 20000) ORD.clear();
   ORD.set(key, R);
@@ -1695,19 +1703,20 @@ async function deskSell(box, tok, give, pg) {
     for (let a = 0; a < Math.min(4, pk.length); a++) for (let b = a + 1; b < Math.min(4, pk.length); b++) pkgs.push({ g: [], p: [pk[a], pk[b]] });
     for (const q of s10.slice(0, 4)) for (const k of pk.slice(0, 3)) pkgs.push({ g: [q], p: [k] });
     let best = null;
-    for (const st of sets) for (const pkg of pkgs) {
+    for (let si = 0; si < sets.length; si++) for (const pkg of pkgs) {
+      const st = sets[si];
       const ratio = nameRatio(st.g, pkg.g, st.p, pkg.p);
       if (ratio < FAIR) continue;
       const r = evalTrade(me, T, st.g, pkg.g, st.p, pkg.p);
       if (r.them < 3) continue;
-      const d = mkDeal(T, st.g, pkg.g, st.p, pkg.p, r, ratio);
+      const d = mkDeal(T, st.g, pkg.g, st.p, pkg.p, r, ratio); d.set = si;
       res.push(d);
       if (st === sets[0] && (!best || d.me > best.me)) best = d;
     }
     need.push({ T, add: free.them, free, best });
   }
   if (tok !== DKTOK) return;
-  const out = { tok0: sig, kind: "sell", what, res, need, single: give.length === 1 && !pg.length ? give[0] : null };
+  const out = { tok0: sig, kind: "sell", what, res, need, single: give.length === 1 && !pg.length ? give[0] : null, sets: sets.map((x) => x.g.map((p) => p.n.split(" ").slice(-1)[0]).concat(x.p.map((k) => pickName(k, true))).join(" + ")) };
   S.deskRes = out;
   drawSearch(box, out);
 }
@@ -1730,19 +1739,27 @@ async function deskBuy(box, tok, get, pr) {
   for (const k of mp) pkgs.push({ g: [], p: [k] });
   for (let a = 0; a < Math.min(6, mp.length); a++) for (let b = a + 1; b < Math.min(6, mp.length); b++) pkgs.push({ g: [], p: [mp[a], mp[b]] });
   for (const p of o6) for (const k of mp.slice(0, 5)) pkgs.push({ g: [p], p: [k] });
+  // getting two or more costs more: also try three of your players, and two plus a pick (only for the combined ask)
+  const big = [];
+  if (sets[0].g.length + sets[0].p.length > 1) {
+    const o5 = o6.slice(0, 5);
+    for (let a = 0; a < o5.length; a++) for (let b = a + 1; b < o5.length; b++) { for (let c = b + 1; c < o5.length; c++) big.push({ g: [o5[a], o5[b], o5[c]], p: [] }); for (const k of mp.slice(0, 3)) big.push({ g: [o5[a], o5[b]], p: [k] }); }
+  }
   const res = [];
   let n = 0;
-  for (const st of sets) for (const pkg of pkgs) {
+  for (let si = 0; si < sets.length; si++) for (const pkg of (si === 0 ? pkgs.concat(big) : pkgs)) {
+    const st = sets[si];
     if (++n % 40 === 0) { await tick(); if (tok !== DKTOK) return; }
     const ratio = nameRatio(pkg.g, st.g, pkg.p, st.p);
     if (ratio < FAIR) continue;
     const r = evalTrade(me, T, pkg.g, st.g, pkg.p, st.p);
     if (r.them < 3) continue;
-    res.push(mkDeal(T, pkg.g, st.g, pkg.p, st.p, r, ratio));
+    const d = mkDeal(T, pkg.g, st.g, pkg.p, st.p, r, ratio); d.set = si;
+    res.push(d);
   }
   if (tok !== DKTOK) return;
   const ctx = evalTrade(me, T, [], get, [], pr);
-  const out = { tok0: sig, kind: "buy", what, res, ctx, T };
+  const out = { tok0: sig, kind: "buy", what, res, ctx, T, get, sets: sets.map((x) => x.g.map((p) => p.n.split(" ").slice(-1)[0]).concat(x.p.map((k) => pickName(k, true))).join(" + ")) };
   S.deskRes = out;
   drawSearch(box, out);
 }
@@ -1756,7 +1773,15 @@ function drawSearch(box, R) {
   // at most two a team when shopping to the whole league
   if (R.kind === "sell" && !dk.team) { const per = {}; L = L.filter((d) => (per[d.team] = (per[d.team] || 0) + 1) <= 2); }
   const good = L.filter((d) => d.me >= 3);
-  const shown = (good.length ? good : L).slice(0, 8);
+  let shown = (good.length ? good : L).slice(0, 8), groups = null;
+  // two or more selected: deals for all of them together first, then each one on its own
+  if (R.sets && R.sets.length > 1) {
+    groups = R.sets.map((label, si) => {
+      const Ls = L.filter((d) => d.set === si), g = Ls.filter((d) => d.me >= 3);
+      return { label, si, good: g.length, list: (g.length ? g : Ls).slice(0, si === 0 ? 5 : 3) };
+    });
+    shown = groups.flatMap((g) => g.list);
+  }
   S.deskDeals = shown;
   let head = "";
   if (R.kind === "sell" && R.single) {
@@ -1768,13 +1793,28 @@ function drawSearch(box, R) {
         return `<button class="nrow" data-need="${x.T}"><span class="nt"><b>${esc(tname(x.T))}</b><small>${esc(fit)}</small></span><span class="na"><small>adds</small><b class="num">${sgn(x.add)}</b></span><span class="nb"><small>best they'd give</small>${x.best ? `<b>${plistText(x.best.get, x.best.pr)}</b><small>you ${sgn(x.best.me)} · them ${sgn(x.best.them)}</small>` : `<span class="note">nothing fair</span>`}</span></button>`;
       }).join("")}</div><p class="note" style="margin:6px 0 0">Tap a team to see all its offers. "Adds" already counts the free agents each team could pick up instead, so it's what he's really worth to them.</p>` : `<p class="note">No team gains much from him once you count what they could get off waivers for free.</p>`}</div>`;
   } else if (R.kind === "buy") {
-    const c = R.ctx;
-    head = `<div class="need"><div class="nh"><b>${esc(R.what)}</b><span class="note">Adds <b class="${c.me >= 0 ? "gainv" : "lossv"}">${sgn(c.me)}</b> to you if he came free (${splitLine(c, "me")}). Losing him costs ${esc(tname(R.T))} <b>${sgn(c.them)}</b>, so that's roughly what they'll want back.</span></div></div>`;
+    const c = R.ctx, ins = (R.get || []).filter((p) => c.a.r.includes(p)), st = lineupStarts(c.a.r, rosDays());
+    const plays = ins.map((p) => { const o = st.get(p.id); return o && o.games ? `${esc(p.n.split(" ").slice(-1)[0])} would be in your lineup about ${o.n} of his ${o.games} games` : ""; }).filter(Boolean).join("; ");
+    const room = c.a.dropped.length ? `; to make room you'd drop ${c.a.dropped.map((p) => esc(p.n)).join(" and ")}` : "";
+    const cost = c.them >= 0
+      ? `${esc(tname(R.T))} barely needs ${(R.get || []).length > 1 ? "them" : "him"}: losing ${(R.get || []).length > 1 ? "them" : "him"} costs them nothing by our numbers (${sgn(c.them)}, since they'd fill the spot off waivers), so don't overpay.`
+      : `Losing ${(R.get || []).length > 1 ? "them" : "him"} costs ${esc(tname(R.T))} about <b>${-Math.round(c.them)}</b>, so that's roughly what they'll want back.`;
+    head = `<div class="need"><div class="nh"><b>${esc(R.what)}</b><span class="note">Adds <b class="${c.me >= 0 ? "gainv" : "lossv"}">${sgn(c.me)}</b> to you if ${(R.get || []).length > 1 ? "they" : "he"} came free (${splitLine(c, "me")}). ${plays ? plays + room + "." : ""} ${cost}</span></div></div>`;
   }
   const lead = R.kind === "sell"
     ? (good.length ? `Best returns for ${esc(R.what)}${dk.team ? ` from ${esc(tname(dk.team))}` : ""}. Every one helps them too and passes the name-value check.` : L.length ? `Nothing fair makes your team better, so keeping ${esc(R.what)} is the better move. The closest offers:` : `No team would pay a fair price for ${esc(R.what)} right now.`)
-    : (good.length ? `Packages ${esc(tname(R.T))} should take for ${esc(R.what)}, cheapest for you first. Each one helps them and is fair by name value.` : L.length ? `Every package they'd take makes your team worse. Here's the price anyway:` : `${esc(tname(R.T))} wouldn't take anything fair from your roster for ${esc(R.what)}.`);
-  box.innerHTML = `${head}<div class="dkres"><div class="dkresh"><p class="note">${lead}</p>${shown.length ? sortBtns : ""}</div>${shown.length ? `<div class="deals">${shown.map((d, i) => dealCard(d, i, "desk")).join("")}</div>` : ""}</div>`;
+    : (good.length ? `Packages ${esc(tname(R.T))} should take for ${esc(R.what)}, cheapest for you first. Each one helps them and is fair by name value.` : L.length ? `Every package they'd take makes your team worse: they'd want more than ${R.sets && R.sets.length > 1 ? "these players are" : "he's"} worth to you. The closest ones:` : `${esc(tname(R.T))} wouldn't take anything fair from your roster for ${esc(R.what)}.`);
+  let body = shown.length ? `<div class="deals">${shown.map((d, i) => dealCard(d, i, "desk")).join("")}</div>` : "";
+  if (groups) {
+    let i0 = 0;
+    body = groups.map((g) => {
+      const h = `<h4 class="dgh">${g.si === 0 ? `All together: ${esc(g.label)}` : `Just ${esc(g.label)}`}</h4>`;
+      const cards = g.list.map((d, j) => dealCard(d, i0 + j, "desk")).join(""); i0 += g.list.length;
+      const note = !g.list.length ? `<p class="note">Nothing fair ${g.si === 0 ? "for all of them together" : "for him alone"}.</p>` : !g.good ? `<p class="note">None of these help you; the closest:</p>` : "";
+      return h + note + (cards ? `<div class="deals">${cards}</div>` : "");
+    }).join("");
+  }
+  box.innerHTML = `${head}<div class="dkres"><div class="dkresh"><p class="note">${lead}</p>${shown.length ? sortBtns : ""}</div>${body}</div>`;
 }
 function plistText(ps, pks) { return ps.map((p) => esc(p.n)).concat((pks || []).map((k) => esc(pickName(k, true)))).join(" + "); }
 function needFit(p, T, r) {
