@@ -260,7 +260,7 @@ function applyInjuries() {
 // their normal shares. That guess is then corrected by who has actually started since he went down (live.json "gst":
 // every team's starting goalie game by game, call-ups included), counting the guess as GP games. Each goalie is only
 // judged on games he was healthy for. So a third-stringer doesn't inherit a starter's job unless he's really starting.
-const GX0 = 0.08, GP = 4;
+const GX0 = 0.08, GP = 4, GKS = 23.2;  // GKS: live.py's prior weight on a goalie's start share, in team games
 let GBM = new Map();
 function buildGoalieBoost() {
   GBM = new Map();
@@ -284,8 +284,11 @@ function buildGoalieBoost() {
         const sh = q.gs / q.gm, guess = Math.min(0.9, sh + (lost * sh) / (tot + GX0));
         const seen = ev.filter((g) => !(q.ret && g[0] < q.ret)), c = seen.filter((g) => g[1] === q.pid).length;
         const nsh = Math.min(0.9, (GP * guess + c) / (GP + seen.length));
+        // the refresh job's multiplier already moved his share toward his starts this season (live.py: 23.2 games of
+        // prior weight), so divide that part out: otherwise the same starts would count twice
+        const lv = liveOf(q), post = lv && lv.tg ? (GKS * sh + (lv.gs || 0)) / (GKS + lv.tg) : sh;
         if (!GBM.has(q.id)) GBM.set(q.id, new Map());
-        GBM.get(q.id).set(day.d, nsh / sh);
+        GBM.get(q.id).set(day.d, nsh / post);
       }
     }
   }
