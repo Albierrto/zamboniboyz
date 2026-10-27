@@ -40,6 +40,10 @@ SEASON = os.environ.get("LIVE_SEASON", "20262027")
 K = {"g": 81.5, "a": 69.7, "pm": 105.8, "pim": 133.5, "hit": 17.5, "blk": 34.7, "fow": 8.2}
 ROLE = {"toi": 0.043, "pp": 0.033}
 KG = {"share": 23.2, "pps": 53.6}
+# start share with recent games counting more (build/inseason_goalie_recency.py, 2015-16..2025-26, LOSO):
+# share = (KD*prior + sum(d^k * started k games ago)) / (KD + sum(d^k)). Prior worth 11.6 team games, each older
+# game counts 0.907 as much as the one after it. Beat the flat K=23.2 update at 7 of 8 checkpoints (RMSE .1609 -> .1585).
+GD = {"k": 11.6, "d": 0.907}
 SK = {"C": {"g": 3.0, "a": 2.0, "fow": 0.25}, "W": {"g": 3.5, "a": 2.5, "fow": 0.0}, "D": {"g": 4.0, "a": 4.0, "fow": 0.25}}
 COM = {"pm": 1.0, "pim": 0.5, "hit": 0.25, "blk": 0.25}
 CATS = ["g", "a", "pm", "pim", "hit", "blk", "fow"]
@@ -75,13 +79,11 @@ def nhl(kind, report, d0=None, d1=None):
     return {r["playerId"]: r for r in d.get("data", [])}
 
 
-def goalie_starts(today, thru=None):
-    """Every team's starting goalie, game by game, for the last 30 days, including call-ups who aren't on the board
-    (the site uses it to split a hurt goalie's starts among whoever is actually starting). Returns
-    ({team: [[date, nhlId], ...]}, {nhlId: name})."""
+def goalie_log(today, thru=None):
+    """Every team's starting goalie, game by game, this season so far, including call-ups who aren't on the board.
+    Returns ({team: [[date, nhlId], ...]} in game order, {nhlId: name})."""
     hi = thru or (today - dt.timedelta(days=1)).isoformat()
-    lo = (dt.date.fromisoformat(hi) - dt.timedelta(days=29)).isoformat()
-    exp = f'seasonId={SEASON} and gameTypeId=2 and gameDate>="{lo}" and gameDate<="{hi}"'
+    exp = f'seasonId={SEASON} and gameTypeId=2 and gameDate<="{hi}"'
     url = ("https://api.nhle.com/stats/rest/en/goalie/summary?isAggregate=false&isGame=true&limit=-1&start=0"
            f"&cayenneExp={urllib.parse.quote(exp)}")
     rows = get(url).get("data", [])
@@ -90,11 +92,31 @@ def goalie_starts(today, thru=None):
     for r in rows:
         if not r.get("gamesStarted") or not r.get("teamAbbrev"):
             continue
-        by.setdefault(r["teamAbbrev"], []).append([str(r["gameDate"])[:10], r["playerId"]])
+        by.setdefault(r["teamAbbrev"], []).append([str(r["gameDate"])[:10], r["gameId"], r["playerId"]])
         names[str(r["playerId"])] = r.get("goalieFullName") or ""
-    for t in by:
-        by[t].sort()
-    return by, names
+    return {t: [[g[0], g[2]] for g in sorted(v)] for t, v in by.items()}, names
+
+
+def goalie_starts(log, today, thru=None):
+    """The last 30 days of the goalie log (the site uses it to split a hurt goalie's starts among whoever is actually
+    starting). Returns {team: [[date, nhlId], ...]}."""
+    hi = thru or (today - dt.timedelta(days=1)).isoformat()
+    lo = (dt.date.fromisoformat(hi) - dt.timedelta(days=29)).isoformat()
+    return {t: [g for g in v if g[0] >= lo] for t, v in log.items() if any(g[0] >= lo for g in v)}
+
+
+def recent_share(prior, starters, nid):
+    """Start share with recent games weighted more (GD). starters = the team's starting goalie ids in game order."""
+    n = len(starters)
+    if not n:
+        return prior
+    num = den = 0.0
+    for k, s in enumerate(reversed(starters)):
+        wk = GD["d"] ** k
+        den += wk
+        if s == nid:
+            num += wk
+    return (GD["k"] * prior + num) / (GD["k"] + den)
 
 
 def norm(s):
@@ -188,11 +210,19 @@ def main():
     recent = nhl("skater", "summary", r_lo, r_hi)
     gsum = nhl("goalie", "summary", None, s_hi); grecent = nhl("goalie", "summary", r_lo, r_hi)
     out["started"] = bool(summ)
+    glog = None
     try:
-        out["gst"], out["gnm"] = goalie_starts(today, thru)
-        print(f"goalie starts: {sum(len(v) for v in out['gst'].values())} games, {len(out['gnm'])} goalies")
-    except Exception as e:  # optional: the site falls back to preseason start shares
+        glog, out["gnm"] = goalie_log(today, thru)
+        out["gst"] = goalie_starts(glog, today, thru)
+        print(f"goalie starts: {sum(len(v) for v in glog.values())} games this season, {len(out['gnm'])} goalies")
+    except Exception as e:  # optional: without it, start shares use the flat K=23.2 update
         print("goalie starts skipped:", e)
+    gtm = {}  # NHL id -> team of his latest start this season
+    for t, v in (glog or {}).items():
+        for d, gid in v:
+            if gid not in gtm or d >= gtm[gid][0]:
+                gtm[gid] = (d, t)
+    gtm = {k: v[1] for k, v in gtm.items()}
     # NHL id -> board player (by NHL id; rookies without one by name)
     byname = {}
     for pid, r in list(summ.items()) + list(gsum.items()):
@@ -208,19 +238,28 @@ def main():
         team = p.get("t") or ""
         rec = {}
         if p["slot"] == "G":
-            s = gsum.get(nid)
-            if not s or not p.get("gs") or not p.get("pts") or not p.get("gm"):
+            if not p.get("gs") or not p.get("pts") or not p.get("gm"):
                 continue
+            s = gsum.get(nid)
+            # a goalie who hasn't played at all: only update him if he's healthy and the log is in (a third-stringer's
+            # share should shrink; a hurt goalie is handled by the injury report instead)
+            if not s and (glog is None or p["id"] in out["inj"] or not glog.get(team)):
+                continue
+            s = s or {}
             starts = s.get("gamesStarted") or 0
             n_team = tg.get(team, 0)
             prior_share = p["gs"] / max(p["gm"], 1)
             prior_pps = p["pts"] / p["gs"]
             fp = 3 * (s.get("wins") or 0) + 0.25 * (s.get("saves") or 0) - (s.get("goalsAgainst") or 0) + 4 * (s.get("shutouts") or 0) + 3 * (s.get("goals") or 0) + 2 * (s.get("assists") or 0) + 0.5 * (s.get("penaltyMinutes") or 0)
             obs_pps = fp / starts if starts else prior_pps
-            share = (KG["share"] * prior_share + starts) / (KG["share"] + n_team) if n_team else prior_share
+            gteam = gtm.get(int(nid), team)  # the team he's starting for now (in-season trades), else his board team
+            if glog is not None and glog.get(gteam):
+                share = recent_share(prior_share, [g[1] for g in glog[gteam]], int(nid))
+            else:
+                share = (KG["share"] * prior_share + starts) / (KG["share"] + n_team) if n_team else prior_share
             pps = (KG["pps"] * prior_pps + starts * obs_pps) / (KG["pps"] + starts)
             mult = (share * pps) / (prior_share * prior_pps)
-            rec = {"m": {"G": round(max(0.3, min(2.0, mult)), 4)}, "n": s.get("gamesPlayed") or 0, "gs": starts, "fp": round(fp, 1), "tg": n_team}
+            rec = {"m": {"G": round(max(0.3, min(2.0, mult)), 4)}, "n": s.get("gamesPlayed") or 0, "gs": starts, "fp": round(fp, 1), "tg": n_team, "sh": round(share, 4)}
             gp10 = (grecent.get(nid) or {}).get("gamesPlayed", 0)
         else:
             s = summ.get(nid)
