@@ -260,7 +260,7 @@ function applyInjuries() {
 // their normal shares. That guess is then corrected by who has actually started since he went down (live.json "gst":
 // every team's starting goalie game by game, call-ups included), counting the guess as GP games. Each goalie is only
 // judged on games he was healthy for. So a third-stringer doesn't inherit a starter's job unless he's really starting.
-const GX0 = 0.08, GP = 4, GKS = 23.2;  // GKS: live.py's prior weight on a goalie's start share, in team games
+const GX0 = 0.08, GP = 4, GKS = 23.2;  // GKS: the old flat prior weight, only used if live.json has no "sh" (start share)
 let GBM = new Map();
 function buildGoalieBoost() {
   GBM = new Map();
@@ -284,9 +284,9 @@ function buildGoalieBoost() {
         const sh = q.gs / q.gm, guess = Math.min(0.9, sh + (lost * sh) / (tot + GX0));
         const seen = ev.filter((g) => !(q.ret && g[0] < q.ret)), c = seen.filter((g) => g[1] === q.pid).length;
         const nsh = Math.min(0.9, (GP * guess + c) / (GP + seen.length));
-        // the refresh job's multiplier already moved his share toward his starts this season (live.py: 23.2 games of
-        // prior weight), so divide that part out: otherwise the same starts would count twice
-        const lv = liveOf(q), post = lv && lv.tg ? (GKS * sh + (lv.gs || 0)) / (GKS + lv.tg) : sh;
+        // the refresh job's multiplier already moved his share toward his starts this season (live.json "sh"), so
+        // divide that part out: otherwise the same starts would count twice
+        const lv = liveOf(q), post = lv && lv.sh != null ? lv.sh : lv && lv.tg ? (GKS * sh + (lv.gs || 0)) / (GKS + lv.tg) : sh;
         if (!GBM.has(q.id)) GBM.set(q.id, new Map());
         GBM.get(q.id).set(day.d, nsh / post);
       }
@@ -2246,6 +2246,7 @@ function renderHow() {
     <li><b>Age:</b> unlike baseball, veterans do this about as often as young players (${Math.round(100 * META.breakout.test.age.rate_old)}% of players 30 and up vs ${Math.round(100 * META.breakout.test.age.rate_young)}% of younger ones in that range), because a hockey season swings a lot with linemates, assists, plus/minus and games played. What differs is what it means. Younger players usually got there with a bigger job (${Math.round(100 * META.breakout.test.age.role_young)}% gained 1.5+ minutes a night or more power-play time, vs ${Math.round(100 * META.breakout.test.age.role_old)}% of veterans), and veterans kept less of it the next season (${Math.round(100 * META.breakout.test.age.keep_old)}% vs ${Math.round(100 * META.breakout.test.age.keep_young)}%). So for players 30 and up the site calls it a <b>big year</b>: worth a pickup, not a keeper price.</li>
     <li><b>Once games start</b>, a refresh job pulls this season's stats from the NHL several times a day and moves every projection. How fast depends on the stat, tested on five past seasons: faceoffs and hits settle within a couple of weeks; goals barely count early because hot shooting streaks don't last. More ice time or a bigger power-play role adds on top. Breakout chances move with it: in testing, about 10 games in, players the update put at 40% or more broke out ${Math.round(100 * META.breakout.test.ins.g10.flag)}% of the time (${Math.round(100 * META.breakout.test.ins.g20.flag)}% by 20 games), while simply chasing a hot start (scoring 30% above his projection) worked ${Math.round(100 * META.breakout.test.ins.g10.hot)}% of the time (${Math.round(100 * META.breakout.test.ins.g20.hot)}% by 20 games).</li>
     <li><b>Pickups</b> give a small bonus for breakout upside (a quarter of the extra points a breakout usually brings, since you can drop him if it doesn't happen), so between two similar free agents the one with more upside ranks first.</li>
+    <li><b>Who's getting the net:</b> each goalie's share of starts begins at the preseason guess and moves toward who has actually been starting, with recent games counting most (each game further back counts about 9% less, so the last two or three weeks matter most). A goalie who hasn't played at all loses share too. Tested on 11 past seasons, this beat a plain season-to-date update at 7 of 8 checkpoints. It still moves more slowly than a hot streak looks on purpose: backups who had started 4 of their team's last 5 around this point went on to make about half the starts the rest of the way, not all of them.</li>
     <li><b>Hurt goalies:</b> when a goalie gets hurt during the season, his starts are split among his healthy teammates and whoever the team calls up, then checked against who has actually started since (the refresh job records every team's starting goalie, game by game). So a third-stringer doesn't inherit a starter's job unless he's really getting the starts. Call-ups who are starting but aren't in this site's player list show up at the top of Pickups if they're free agents.</li>
     <li><b>Not playing lately</b> means his team played 3 or more games in the last 10 days and he didn't play: usually an injury or healthy scratch.</li>
   </ul>
