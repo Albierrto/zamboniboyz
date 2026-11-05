@@ -496,6 +496,18 @@ button.slot{width:100%;background:none;border:0;border-top:1px solid var(--line)
 .ledger tr.tot td{font-weight:700;border-bottom:0}
 .even{display:flex;flex-direction:column;gap:6px}
 .even .note{margin:0}
+.ways{margin-top:10px;display:flex;flex-direction:column;gap:6px}
+.ways .wh{display:flex;flex-direction:column;gap:2px;font-size:15px;margin-bottom:2px}
+.ways .wk{margin:4px 0 0}
+.wayr{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.6fr) auto;gap:6px 12px;align-items:center;border:1px solid var(--line);background:var(--panel2);border-radius:10px;padding:9px 11px;cursor:pointer;font:inherit;color:inherit;text-align:left;min-height:48px}
+.wayr:hover{border-color:color-mix(in srgb,var(--ice) 55%,var(--line))}
+.wayr small{display:block;font-size:12px;color:var(--ink3);margin-top:2px}
+.wayr .wl b{font-size:14px}
+.wayr .wd{font-size:13.5px;color:var(--ink2)}
+.wayr .wd b{color:var(--ink);font-weight:600}
+.wayr .wn{display:flex;flex-direction:column;align-items:flex-end;gap:3px;white-space:nowrap}
+.wayr .wn b{font-size:15px}
+@media (max-width:720px){ .wayr{grid-template-columns:minmax(0,1fr) auto} .wayr .wd{grid-column:1 / -1;grid-row:2} }
 .evn{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;border:1px dashed var(--line);background:var(--panel);border-radius:10px;padding:8px 10px;cursor:pointer;font:inherit;color:inherit;text-align:left;min-height:44px}
 .gaps{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .gaps h4{margin:0 0 6px;font-size:14px}
@@ -567,6 +579,6 @@ body.trayup main{padding-bottom:70px}
 <div class="toast" id="toast" hidden><span id="toastMsg"></span><button id="toastBtn">Undo</button></div>
 
 <script src="data/board.js?v=20261024a"></script>
-<script src="app.js?v=20261027a"></script>
+<script src="app.js?v=20261105a"></script>
 </body>
 </html>
