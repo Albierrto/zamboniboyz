@@ -119,6 +119,61 @@ def recent_share(prior, starters, nid):
     return (GD["k"] * prior + num) / (GD["k"] + den)
 
 
+def current_teams():
+    """NHL id -> the team he's on now (the NHL's bios report). Players are traded after the board is built: without
+    this the site kept Matthew Knies on Toronto's schedule six weeks after he went to Columbus, and Connor Hellebuyck
+    in Winnipeg's net after his trade to New Jersey. Last season's report is read first so players who haven't
+    played yet this season (injured) are covered too; this season's wins."""
+    cur = {}
+    prev = f"{int(SEASON[:4]) - 1}{SEASON[:4]}"
+    for season in (prev, SEASON):
+        for kind in ("skater", "goalie"):
+            exp = urllib.parse.quote(f"seasonId={season} and gameTypeId=2")
+            d = get(f"https://api.nhle.com/stats/rest/en/{kind}/bios?isAggregate=false&isGame=false&limit=-1&start=0&cayenneExp={exp}")
+            time.sleep(1.5)
+            for r in d.get("data", []):
+                if r.get("currentTeamAbbrev"):
+                    cur[r["playerId"]] = r["currentTeamAbbrev"]
+    return cur
+
+
+def goalie_plan(players, tm, glog):
+    """What each goalie's start share should be measured against, now that goalies change teams and come back from
+    injuries. Returns {board id: (prior share, the games that count as evidence, as a list of starter ids)}.
+    - Prior: his preseason share, rescaled when his team's goalies changed (someone was traded in or out), so the
+      team's goalies still add up to what the board gave that team (at most 97% of its games).
+    - Evidence: his current team's starters, game by game, but only since the newest real arrival: a goalie with a
+      20%+ share who first started for this team 3 or more games in because he was hurt in camp or came in a trade.
+      Games before that say who played while he wasn't there, not how the net is split now. A lesser goalie who
+      arrived late is judged only on games since his own first start."""
+    G = [p for p in players if p["slot"] == "G" and p.get("gs") and p.get("gm") and p.get("pid")]
+    cur = lambda p: tm.get(p["id"]) or p.get("t") or ""
+    share = lambda p: p["gs"] / max(p["gm"], 1)
+    board, now = {}, {}
+    for p in G:
+        board.setdefault(p.get("t") or "", []).append(p)
+        now.setdefault(cur(p), []).append(p)
+    plan = {}
+    for t, group in now.items():
+        old = board.get(t, [])
+        prior = {p["id"]: share(p) for p in group}
+        if {p["id"] for p in group} != {p["id"] for p in old} and old:
+            target = min(0.97, sum(p["gs"] for p in old) / max(p["gm"] for p in old))
+            tot = sum(prior.values())
+            k = max(0.6, min(1.6, target / tot)) if tot > 0 else 1.0
+            prior = {i: min(0.85, v * k) for i, v in prior.items()}
+        starters = [g[1] for g in (glog or {}).get(t, [])]
+        first, late = {}, {}
+        for p in group:
+            first[p["id"]] = starters.index(int(p["pid"])) if int(p["pid"]) in starters else None
+            late[p["id"]] = first[p["id"]] is not None and first[p["id"]] >= 3 and bool(p.get("ret") or (p.get("t") or "") != t)
+        r0 = max([first[p["id"]] for p in group if late[p["id"]] and prior[p["id"]] >= 0.2] or [0])
+        for p in group:
+            i0 = max(r0, first[p["id"]] if late[p["id"]] else 0)
+            plan[p["id"]] = (prior[p["id"]], starters[i0:])
+    return plan
+
+
 def norm(s):
     s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode().lower()
     return re.sub(r"\s+", " ", re.sub(r"[^a-z ]", "", s.replace("-", " ").replace(".", " "))).strip()
@@ -210,6 +265,15 @@ def main():
     recent = nhl("skater", "summary", r_lo, r_hi)
     gsum = nhl("goalie", "summary", None, s_hi); grecent = nhl("goalie", "summary", r_lo, r_hi)
     out["started"] = bool(summ)
+    # who has changed NHL teams since the board was built: {board id: team now}
+    try:
+        cur_team = current_teams()
+        tm = {p["id"]: cur_team[p["pid"]] for p in players if p.get("pid") and cur_team.get(p["pid"]) and cur_team[p["pid"]] != (p.get("t") or "")}
+        print(f"teams: {len(tm)} players have moved since the board was built")
+    except Exception as e:  # keep the last good list
+        print("current teams skipped:", e)
+        tm = old.get("tm") or {}
+    out["tm"] = tm
     glog = None
     try:
         glog, out["gnm"] = goalie_log(today, thru)
@@ -217,12 +281,7 @@ def main():
         print(f"goalie starts: {sum(len(v) for v in glog.values())} games this season, {len(out['gnm'])} goalies")
     except Exception as e:  # optional: without it, start shares use the flat K=23.2 update
         print("goalie starts skipped:", e)
-    gtm = {}  # NHL id -> team of his latest start this season
-    for t, v in (glog or {}).items():
-        for d, gid in v:
-            if gid not in gtm or d >= gtm[gid][0]:
-                gtm[gid] = (d, t)
-    gtm = {k: v[1] for k, v in gtm.items()}
+    gplan = goalie_plan(players, tm, glog)
     # NHL id -> board player (by NHL id; rookies without one by name)
     byname = {}
     for pid, r in list(summ.items()) + list(gsum.items()):
@@ -235,7 +294,7 @@ def main():
                 nid = c[0]
         if not nid:
             continue
-        team = p.get("t") or ""
+        team = tm.get(p["id"]) or p.get("t") or ""
         rec = {}
         if p["slot"] == "G":
             if not p.get("gs") or not p.get("pts") or not p.get("gm"):
@@ -252,9 +311,8 @@ def main():
             prior_pps = p["pts"] / p["gs"]
             fp = 3 * (s.get("wins") or 0) + 0.25 * (s.get("saves") or 0) - (s.get("goalsAgainst") or 0) + 4 * (s.get("shutouts") or 0) + 3 * (s.get("goals") or 0) + 2 * (s.get("assists") or 0) + 0.5 * (s.get("penaltyMinutes") or 0)
             obs_pps = fp / starts if starts else prior_pps
-            gteam = gtm.get(int(nid), team)  # the team he's starting for now (in-season trades), else his board team
-            if glog is not None and glog.get(gteam):
-                share = recent_share(prior_share, [g[1] for g in glog[gteam]], int(nid))
+            if glog is not None and glog.get(team) and p["id"] in gplan:
+                share = recent_share(gplan[p["id"]][0], gplan[p["id"]][1], int(nid))
             else:
                 share = (KG["share"] * prior_share + starts) / (KG["share"] + n_team) if n_team else prior_share
             pps = (KG["pps"] * prior_pps + starts * obs_pps) / (KG["pps"] + starts)
@@ -289,7 +347,10 @@ def main():
                     m[slot] = round(max(0.5, min(1.8, po / pr)), 4)
             best = p["slot"] if p["slot"] in SK else next(iter(m), "W")
             fp = sum(w(best, c) * tot[c] for c in CATS)
+            fps = {slot: round(sum(w(slot, c) * tot[c] for c in CATS), 1) for slot in m} if len(m) > 1 else None
             rec = {"m": m, "n": n, "fp": round(fp, 1), "toi": round(t_now, 1), "dtoi": round(dtoi, 2), "pp": round(pp_now, 2), "dpp": round(dpp, 2), "tg": tg.get(team, 0)}
+            if fps:
+                rec["fps"] = fps  # what he has scored at each position he can play (faceoffs only count at center)
             gp10 = (recent.get(nid) or {}).get("gamesPlayed", 0)
         # sitting out: his team played 3+ games in the last 10 days and he played none
         if tg10.get(team, 0) >= 3 and gp10 == 0:
