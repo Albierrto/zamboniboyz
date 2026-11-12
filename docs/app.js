@@ -161,7 +161,7 @@ function trendTag(p) {
 }
 function outTag(p) { const l = liveOf(p); return l && l.out ? `<span class="pill bad" title="His team played ${l.out} games in the last 10 days and he played none">Not playing lately</span>` : ""; }
 const RC = new Map(), EC = new Map();
-function clearCaches() { MEMO.clear(); RC.clear(); EC.clear(); GL.clear(); NL.clear(); ORD.clear(); NM.clear(); MGC.clear(); GSS.o = null; }
+function clearCaches() { MEMO.clear(); RC.clear(); EC.clear(); GL.clear(); NL.clear(); ORD.clear(); NM.clear(); MGC.clear(); GN.clear(); GSS.o = null; }
 function rateAt(p, s) {
   const k = p.id + s + (MKT.on ? "m" : "");
   let r = RC.get(k);
@@ -425,7 +425,11 @@ function nightLineup(list, want, day) {
   const pick = (arr, s, n) => {
     arr.map((p) => [p, rateOn(p, s, day)]).sort((a, b) => b[1] - a[1]).slice(0, n).forEach(([p, r]) => { total += r; if (start) start.set(p.id, s); });
   };
-  pick(D, "D", CAP.D); pick(G, "G", CAP.G);
+  pick(D, "D", CAP.D);
+  // goalies: every one with a game is in the mix (see goalieNight); `gu` says how often each is really used
+  const gn = goalieNight(G, day);
+  total += gn.total;
+  if (start) for (const id of gn.use.keys()) start.set(id, "G");
   // forwards: dp over (centers used, wingers used)
   const NC = CAP.C + 1, NW = CAP.W + 1;
   let dp = new Array(NC * NW).fill(-1); dp[0] = 0;
@@ -450,8 +454,57 @@ function nightLineup(list, want, day) {
       if (x === 1) { start.set(F[i].id, "C"); c--; } else if (x === 2) { start.set(F[i].id, "W"); w--; }
     }
   }
-  return { total, start };
+  return { total, start, gu: gn.use };
 }
+// Goalies aren't picked like skaters. A skater with a game plays, so the lineup is just the best ones. A goalie only
+// scores when he starts, and you know who's starting before the lineup locks (a minute before each game), so each
+// night you play whichever of your goalies got the net, up to 2. Each goalie with a game starts with chance
+// (his share of his team's starts) and scores his points per start when he does; two goalies on the same NHL team
+// can't both start. The night's goalie points are the average, over who ends up starting, of the best 2 starters.
+// So a 3rd or 4th goalie counts nearly every time he starts: it's rare that 3 of them start on the same night.
+// Before 2026-11-12 the 2 goalies with the most points per team game took the spots every night their teams played,
+// as if you had to guess: a 4th goalie showed up in the lineup 0 nights and looked like a free drop.
+function gStart(p, day) {
+  const r = rateOn(p, "G", day);
+  if (!(r > 0)) return [0, 0];
+  let sh = goalieShare(p) * gMult(p, day);
+  if (S.gsOv[p.id] != null && p.gs > 0) sh *= S.gsOv[p.id] / p.gs;
+  const ps = sh > 0 ? Math.min(GCAP, sh) : 1;
+  return [ps, r / ps];
+}
+const GN = new Map();
+function goalieNight(G, day) {
+  if (!G.length) return GN0;
+  let k = "";
+  for (const p of G) k += p.id + (GBM.has(p.id) ? "@" + day.d : "") + ",";
+  let out = GN.get(k);
+  if (out) return out;
+  const a = [];
+  for (const p of G) { const [ps, v] = gStart(p, day); if (ps > 0) a.push({ p, ps, v }); }
+  a.sort((x, y) => y.v - x.v || (x.p.id < y.p.id ? -1 : 1));
+  let total = 0;
+  const use = new Map();
+  for (let i = 0; i < a.length; i++) {
+    const g = a[i];
+    // chance that fewer than 2 of the better goalies (on other NHL teams) start that night
+    let room = 1;
+    if (i) {
+      const q = new Map();
+      for (let j = 0; j < i; j++) if (a[j].p.t !== g.p.t) q.set(a[j].p.t, (q.get(a[j].p.t) || 0) + a[j].ps);
+      const dp = new Array(CAP.G).fill(0); dp[0] = 1;
+      for (const x of q.values()) { const y = Math.min(1, x); for (let c = CAP.G - 1; c >= 0; c--) dp[c] = dp[c] * (1 - y) + (c ? dp[c - 1] * y : 0); }
+      room = dp.reduce((t, x) => t + x, 0);
+    }
+    const pu = g.ps * room;
+    total += pu * g.v;
+    use.set(g.p.id, { pu, pts: pu * g.v, ps: g.ps, v: g.v });
+  }
+  out = { total, use };
+  if (GN.size > 200000) GN.clear();
+  GN.set(k, out);
+  return out;
+}
+const GN0 = { total: 0, use: new Map() };
 // a night's best lineup depends only on who plays that night, so it's cached by that set of players:
 // a trade only changes the nights the traded players have games
 const NL = new Map();
@@ -490,8 +543,11 @@ function nightMarg(on, day) {
   if (!v) {
     v = [];
     const nl = nightLineup(on, true, day), bench = on.filter((p) => !nl.start.has(p.id));
+    const Gs = nl.gu.size ? on.filter((p) => p.slot === "G") : null;
     for (const p of on) {
       const sl = nl.start.get(p.id); if (!sl) continue;
+      // a goalie: the night's goalie points with him minus without him (the others pick up some of his starts)
+      if (sl === "G") { v.push([p.id, goalieNight(Gs, day).total - goalieNight(Gs.filter((q) => q !== p), day).total]); continue; }
       let sub = 0;
       for (const q of bench) if (elig(q).includes(sl)) sub = Math.max(sub, rateOn(q, sl, day));
       v.push([p.id, rateOn(p, sl, day) - sub]);
@@ -602,13 +658,21 @@ function lineupStarts(list, days) {
   return memo("starts|" + list.map((p) => p.id).sort().join(",") + "|" + days.length + "|" + (days[0] ? days[0].d : ""), () => {
     const out = new Map(), R = rosterOrder(list);
     for (const p of list) out.set(p.id, { n: 0, pts: 0, games: 0, cut: 0, by: {} });
+    // a goalie's "games" are the games he's expected to start (his team's games times his share), and his nights
+    // in the lineup are the starts you'd have a goalie spot for; both are rounded at the end
     for (const day of days) {
       const on = activeOn(R, day);
-      for (const p of list) if (plays(p, day)) { const o = out.get(p.id); o.games++; if (!on.includes(p)) o.cut++; }
+      for (const p of list) if (plays(p, day)) { const o = out.get(p.id), w = p.slot === "G" ? gStart(p, day)[0] : 1; o.games += w; if (!on.includes(p)) o.cut += w; }
       if (!on.length) continue;
       const nl = nightLineup(on, true, day);
-      for (const p of on) { const sl = nl.start.get(p.id); if (sl) { const o = out.get(p.id); o.n++; o.pts += rateOn(p, sl, day); o.by[sl] = (o.by[sl] || 0) + 1; } }
+      for (const p of on) {
+        const sl = nl.start.get(p.id); if (!sl) continue;
+        const o = out.get(p.id), u = sl === "G" ? nl.gu.get(p.id) : null;
+        if (u) { o.n += u.pu; o.pts += u.pts; o.by.G = (o.by.G || 0) + u.pu; }
+        else { o.n++; o.pts += rateOn(p, sl, day); o.by[sl] = (o.by[sl] || 0) + 1; }
+      }
     }
+    for (const p of list) if (p.slot === "G") { const o = out.get(p.id); const cr = o.games > 0 ? o.cut / o.games : 0; o.g = true; o.n = Math.round(o.n); o.games = Math.round(o.games); o.cut = Math.round(cr * o.games); if (o.by.G != null) o.by.G = Math.round(o.by.G); }
     return out;
   });
 }
@@ -715,7 +779,7 @@ function shapeOf(list, days) {
     const on = activeOn(R, day);
     if (!on.length) continue;
     const nl = nightLineup(on, true, day);
-    for (const p of on) { const s = nl.start.get(p.id); if (s) { const r = rateOn(p, s, day); out[s] += r; out.total += r; } }
+    for (const p of on) { const s = nl.start.get(p.id); if (s) { const r = s === "G" ? nl.gu.get(p.id).pts : rateOn(p, s, day); out[s] += r; out.total += r; } }
   }
   return out;
 }
@@ -1134,17 +1198,20 @@ function renderTeam() {
     const nl = nightLineup(on, true, night);
     const bySlot = { C: [], W: [], D: [], G: [] };
     for (const p of on) { const s = nl.start.get(p.id); if (s) bySlot[s].push(p); }
+    bySlot.G.sort((a, b) => nl.gu.get(b.id).v - nl.gu.get(a.id).v);
     const sit = on.filter((p) => !nl.start.has(p.id));
     const hurtOut = roster.filter((p) => !plays(p, night) && night.teams.has(p.t) && p.ret && night.d < p.ret);
     const off = roster.filter((p) => !plays(p, night) && !hurtOut.includes(p));
-    const slotLine = (s) => { const n = CAP[s] - bySlot[s].length; return `<div class="lgrp"><div class="lh">${POSNAME[s]}<small>${bySlot[s].length} of ${CAP[s]}${n ? ` · ${n} empty` : ""}</small></div>${bySlot[s].map((p) => `<button class="lp" data-open="${esc(p.id)}">${face(p)}<span>${esc(p.n)}${s !== p.slot ? `<small>put him in a ${s} spot</small>` : ""}${dtd(p) ? `<small class="bad">day-to-day: make sure he's playing</small>` : ""}</span><b class="num">${fmt(rateOn(p, s, night), 1)}</b></button>`).join("")}${!bySlot[s].length ? `<div class="lp empty"><span>None of your ${POSPL[s]} play this night</span></div>` : ""}</div>`; };
-    const empties = SLOTS.reduce((a, s) => a + CAP[s] - bySlot[s].length, 0);
+    // goalies: everyone with a game is listed, best first; you play the ones who are confirmed to start
+    const goalLine = () => { const L = bySlot.G; return `<div class="lgrp"><div class="lh">${POSNAME.G}<small>${L.length} with a game · up to ${CAP.G} can play</small></div>${L.map((p, i) => { const u = nl.gu.get(p.id); return `<button class="lp gl" data-open="${esc(p.id)}">${face(p)}<span>${esc(p.n)}<small>if he starts (${Math.round(100 * u.ps)}% chance): about ${fmt(u.v, 1)} pts${L.length > CAP.G && i >= CAP.G ? `, and only if fewer than ${CAP.G} above him start` : ""}</small></span><b class="num">${fmt(u.pts, 1)}</b></button>`; }).join("")}${!L.length ? `<div class="lp empty"><span>None of your goalies' teams play this night</span></div>` : ""}</div>`; };
+    const slotLine = (s) => { if (s === "G") return goalLine(); const n = CAP[s] - bySlot[s].length; return `<div class="lgrp"><div class="lh">${POSNAME[s]}<small>${bySlot[s].length} of ${CAP[s]}${n ? ` · ${n} empty` : ""}</small></div>${bySlot[s].map((p) => `<button class="lp" data-open="${esc(p.id)}">${face(p)}<span>${esc(p.n)}${s !== p.slot ? `<small>put him in a ${s} spot</small>` : ""}${dtd(p) ? `<small class="bad">day-to-day: make sure he's playing</small>` : ""}</span><b class="num">${fmt(rateOn(p, s, night), 1)}</b></button>`).join("")}${!bySlot[s].length ? `<div class="lp empty"><span>None of your ${POSPL[s]} play this night</span></div>` : ""}</div>`; };
+    const empties = SLOTS.reduce((a, s) => a + Math.max(0, CAP[s] - bySlot[s].length), 0);
     lineupHTML = `<div class="tonight" id="tonight">
       <div class="th2"><div><div class="k">Set your lineup for</div><div class="d">${esc(dLabel(night.d, { weekday: "long", month: "short", day: "numeric" }))}</div></div><div class="tp"><b class="num">${fmt(nl.total, 1)}</b><small>expected pts</small></div></div>
-      <p class="note">In Fantrax, put these players in your starting spots. Numbers are expected points that night.</p>
+      <p class="note">In Fantrax, put these players in your starting spots. Numbers are expected points that night (for a goalie, that already counts the chance he sits).</p>
       <div class="lgrid">${SLOTS.map(slotLine).join("")}</div>
       <div class="benchline">${sit.length ? `<div><b>Bench these (they play, but your starters are better):</b> ${sit.map((p) => esc(p.n)).join(", ")}</div>` : ""}${hurtOut.length ? `<div class="bad"><b>Hurt, leave out:</b> ${hurtOut.map((p) => `${esc(p.n)} (${esc(backWhen(p))})`).join(", ")}</div>` : ""}${off.length ? `<div><b>No game this night:</b> ${off.map((p) => esc(p.n)).join(", ")}</div>` : ""}${empties >= 3 ? `<div>${empties} starting spots are empty that night. A free agent who plays then is free points: see <button class="linkbtn" data-tab="adds">Pickups → This week</button>.</div>` : ""}</div>
-      <p class="note">Goalies only score if they actually start. Starters are usually confirmed the morning of the game: check <a href="https://www.dailyfaceoff.com/starting-goalies/" target="_blank" rel="noopener">Daily Faceoff's starting goalies</a> and bench a goalie who's sitting.</p>
+      <p class="note">Goalies only score if they actually start, and you can find out before your lineup locks (a minute before each game). Starters are usually confirmed the morning of the game: check <a href="https://www.dailyfaceoff.com/starting-goalies/" target="_blank" rel="noopener">Daily Faceoff's starting goalies</a>, play the ones who are starting (the higher ones on this list if more than ${CAP.G} are) and bench the ones who are sitting.</p>
     </div>`;
   }
 
@@ -1169,7 +1236,7 @@ function renderTeam() {
   if (stash && stash.b >= 0.22) todo.push(`<li><b>Keep an eye on ${esc(stash.p.n)}</b> (${esc(stash.p.t)}): the best ${isVet(stash.p) ? "big-year" : "breakout"} bet on waivers, a ${Math.round(100 * stash.b)}% chance he beats his projection by 30% or more and ends up worth a roster spot (${Math.round(100 * stash.p.bo[1])}% is typical for a player projected like him). Worth a bench spot if you have a weak one. <button class="linkbtn" data-bo="1">Breakout list</button></li>`);
   const chip = roster.filter(analystsBacked).sort((a, b) => mval(b) - mval(a))[0];
   if (chip) todo.push(`<li><b>Shop ${esc(chip.n)} in trades.</b> The experts rank him ${ordinal(chip.mr)} among ${POSPL[chip.slot]}, but our numbers have him ${ordinal(chip.orank)} for this league's scoring, so other managers will likely value him more than he helps you. Use him to get what you need. <button class="linkbtn" data-shopid="${esc(chip.id)}">Find trades for him</button></li>`);
-  todo.push(`<li><b>Check goalies each game day.</b> A goalie who doesn't start scores nothing, so swap him out if he's on the bench.</li>`);
+  todo.push(`<li><b>Check goalies each game day.</b> A goalie who doesn't start scores nothing, so play the ones who are confirmed to start and sit the rest. That's why a 3rd or 4th goalie is worth having: he plays for you nearly every time he starts.</li>`);
   // injuries go first: they come from the injury report, checked several times a day
   const injTodo = [], irUsed = roster.filter((p) => onIR(p.id)).length;
   for (const p of inj) {
@@ -1221,7 +1288,7 @@ function renderTeam() {
     <h3 class="sectitle">This week, night by night</h3>
     <div class="days">${dayRows || '<div class="empty">No games left this week.</div>'}</div>
     <h3 class="sectitle">Your roster</h3>
-    <p class="note" style="margin:-2px 0 10px">Your usual starters and bench. Points are what each player should score for you the rest of the season, counting only the nights he'd actually be in your lineup (a bench player on a busy night scores nothing). Tap a player for the full story.</p>
+    <p class="note" style="margin:-2px 0 10px">Your usual starters and bench. Points are what each player should score for you the rest of the season, counting only the nights he'd actually be in your lineup (a bench player on a busy night scores nothing). A goalie counts every time he starts and you have a goalie spot for him, even a 3rd or 4th one listed on the bench here. Tap a player for the full story.</p>
     <div class="rink">
       ${grp("C", "Centers")}${grp("W", "Wingers")}${grp("D", "Defense")}${grp("G", "Goalies")}
       <div class="slotgrp"><h3>Bench<small>${lu.bench.length} of ${BENCH}</small></h3>${lu.bench.map((p) => rowMini(p, rosOf(p), null, ST.get(p.id))).join("")}</div>
@@ -1248,7 +1315,7 @@ function backNames(team) {
 function startsText(st, p) {
   if (!st || !st.games) return "";
   if (st.cut >= st.games * 0.9) return p && hurt(p) ? "you'll be over the roster limit when he's back, and he'd be the one to cut" : `the one to cut when ${esc(backNames(S.team))} ${backNames(S.team).includes(" and ") ? "come" : "comes"} back (18-man limit)`;
-  return `in the lineup ${st.n} of ${st.games} games`;
+  return st.g ? `in your lineup for about ${st.n} of his ${st.games} expected starts` : `in the lineup ${st.n} of ${st.games} games`;
 }
 function rowMini(p, pts, s, st) {
   const flags = [];
@@ -1373,22 +1440,30 @@ function forYou(x, mode, list) {
   const st0 = lineupStarts(R, days), st = lineupStarts(R2, days), o = st.get(p.id);
   if (!o || !o.games) return "";
   const gk = p.slot === "G";
-  if (!o.n) return `In your lineup on none of his ${gk ? "team's " : ""}${o.games} games${mode === "week" ? " this week" : ""}: he's only a fill-in if someone gets hurt.`;
+  if (!o.n) return gk ? `He's expected to start about ${o.games} game${o.games === 1 ? "" : "s"}${mode === "week" ? " this week" : ""}, and your other goalies would have the spots on those nights: he's only a fill-in if someone gets hurt.` : `In your lineup on none of his ${o.games} games${mode === "week" ? " this week" : ""}: he's only a fill-in if someone gets hurt.`;
   const by = Object.entries(o.by).sort((a, b) => b[1] - a[1]);
   const where = gk ? "" : by.length > 1 ? ` (${by.map(([sl, n]) => `${n} at ${POSNAME[sl].toLowerCase()}`).join(", ")})` : ` at ${POSNAME[by[0][0]].toLowerCase()}`;
   // starts he takes: all of the dropped player's, and whatever the others lose (with an open spot nobody leaves until later)
   const gone = drop && !x.free ? drop : null, n0 = (q) => (st0.get(q.id) ? st0.get(q.id).n : 0), n1 = (q) => (st.get(q.id) ? st.get(q.id).n : 0);
   const c0 = (q) => (st0.get(q.id) ? st0.get(q.id).cut : 0), c1 = (q) => (st.get(q.id) ? st.get(q.id).cut : 0);
-  const lost = R.map((q) => ({ q, n: q === gone ? n0(q) : n0(q) - n1(q), cut: q !== gone && c1(q) - c0(q) >= 3 })).filter((z) => z.n > 0).sort((a, b) => b.n - a.n);
+  // a goalie only takes other goalies' starts and a skater other skaters' nights; anyone can be the one pushed off the roster
+  const lostAll = R.map((q) => ({ q, n: q === gone ? n0(q) : n0(q) - n1(q), cut: q !== gone && c1(q) - c0(q) >= 3 })).filter((z) => z.n > 0).sort((a, b) => b.n - a.n);
+  const lost = lostAll.filter((z) => (z.q.slot === "G") === gk);
   const takenN = lost.reduce((t, z) => t + z.n, 0);
   // a player pushed off the roster (over the 18-player limit once injured players return) isn't "replaced" in the lineup
-  const cutz = lost.find((z) => z.cut && z.n >= 3);
+  const cutz = lostAll.find((z) => z.cut && z.n >= 3);
   const took = lost.filter((z) => z.n >= 3 && !z.cut).slice(0, 2).map((z, i) => `${esc(lastName(z.q))} (${z.q === gone ? "your drop, " : ""}${z.n}${i && z.q !== gone ? "" : " nights"})`);
-  let txt = `In your lineup about <b>${o.n}</b> of his ${gk ? "team's " : ""}${o.games} games${mode === "week" ? " this week" : ""}${where}`;
-  txt += took.length ? `, mostly in place of ${took.join(" and ")}` : "";
-  txt += o.n - takenN >= 3 ? `${took.length ? ", plus" : ","} filling ${o.n - takenN} nights your lineup has an empty spot now` : "";
+  let txt = gk ? `He's expected to start about ${o.games} game${o.games === 1 ? "" : "s"}${mode === "week" ? " this week" : ""}, and you'd have a goalie spot for about <b>${o.n}</b> of them (you see who's starting before your lineup locks)` : `In your lineup about <b>${o.n}</b> of his ${o.games} games${mode === "week" ? " this week" : ""}${where}`;
+  if (gk) {
+    const sits = lost.filter((z) => z.q !== gone && !z.cut && z.n >= 2).slice(0, 2).map((z) => `${esc(lastName(z.q))} about ${z.n}`);
+    txt += gone && gone.slot === "G" && n0(gone) >= 2 ? `. He'd take over the ${n0(gone)} starts ${esc(lastName(gone))} (your drop) plays for you now` : "";
+    txt += sits.length ? `. Your other goalies would sit a few more of their starts (${sits.join(", ")})` : "";
+  } else {
+    txt += took.length ? `, mostly in place of ${took.join(" and ")}` : "";
+    txt += o.n - takenN >= 3 ? `${took.length ? ", plus" : ","} filling ${o.n - takenN} nights your lineup has an empty spot now` : "";
+  }
   txt += ".";
-  if (cutz) txt += ` Keeping him means you're over the 18-player limit once your injured players are back, so ${esc(cutz.q.n)} would be the one to cut (he'd lose ${cutz.n} nights).`;
+  if (cutz) txt += ` Keeping him means you're over the 18-player limit once your injured players are back, so ${esc(cutz.q.n)} would be the one to cut (he'd lose ${cutz.n} ${cutz.q.slot === "G" ? "starts" : "nights"}).`;
   const v = valOf(p), vs = valSlot(p);
   if (v != null && v < -1 && !gk) {
     const flex = by.length > 1 && by[1][1] >= 0.2 * o.n;
@@ -1423,7 +1498,7 @@ function whyNotTop(top, tx, vs, R, days, st0) {
     const a = rateAt(top, vs), b = rateAt(mate, vs), close = Math.abs(a - b) <= 0.1 * Math.max(a, b);
     return `${pre} he plays for the same team as ${esc(mate.n)} (${esc(top.t)}), so his games land on the same nights${close ? `, and ${esc(lastName(mate))} scores about as much a game (${fmt(b, 1)} vs ${fmt(a, 1)})` : ""}. ${end}`;
   }
-  if (st && st.games && st.n < 0.8 * st.games) return `${pre} he'd only make your lineup about ${st.n} of his ${st.games} games because your ${POSPL[vs]} are already full on most of his nights. ${end}`;
+  if (st && st.games && st.n < 0.8 * st.games) return st.g ? `${pre} you'd only have a goalie spot for about ${st.n} of his ${st.games} expected starts, because your better goalies start on a lot of the same nights. ${end}` : `${pre} he'd only make your lineup about ${st.n} of his ${st.games} games because your ${POSPL[vs]} are already full on most of his nights. ${end}`;
   if (main) return `${pre} he'd mostly take ${esc(lastName(main.q))}'s nights, and ${esc(lastName(main.q))} scores about as much a game (${fmt(rateAt(main.q, vs), 1)} vs ${fmt(rateAt(top, vs), 1)}). ${end}`;
   return `${pre} ${end}`;
 }
@@ -1484,11 +1559,13 @@ function ledgerText(x, z, mode) {
   const nm = (q) => esc(lastName(q)), wk = mode === "week" ? " this week" : "";
   for (const e of Lg.rows) {
     const v = `<b>${sgn(e.pts)}</b>`;
-    if (e.q === p) parts.push(`${v} ${nm(p)} plays ${e.n} of his games${wk} for you`);
+    if (e.q === p) parts.push(p.slot === "G" ? `${v} ${nm(p)} is in your net for about ${e.n} start${e.n === 1 ? "" : "s"}${wk}` : `${v} ${nm(p)} plays ${e.n} of his games${wk} for you`);
     else if (e.q === d) {
       const b = Lg.before.get(d.id);
-      parts.push(b && b.n ? `${v} ${nm(d)}'s ${-e.n} nights${wk} are gone` : `${nm(d)} wasn't playing for you${wk}${b && b.cut >= 3 ? " (he was already the one to cut once your injured players are back, so you'll still be a player over then)" : ""}`);
+      parts.push(b && b.n ? `${v} ${nm(d)}'s ${-e.n} ${d.slot === "G" ? "starts" : "nights"}${wk} are gone` : `${nm(d)} wasn't playing for you${wk}${b && b.cut >= 3 ? " (he was already the one to cut once your injured players are back, so you'll still be a player over then)" : ""}`);
     } else if (e.cut >= 3 && e.pts < 0) parts.push(`${v} ${nm(e.q)} would have to be cut once your injured players are back`);
+    else if (e.q.slot === "G") parts.push(e.pts < 0 ? `${v} ${nm(e.q)} sits ${-e.n >= 1 ? `about ${-e.n} more of his starts` : "a start here and there"}` : `${v} ${nm(e.q)} gets a goalie spot for ${e.n >= 1 ? `about ${e.n} more of his starts` : "a start here and there"}`);
+    else if (!e.n) parts.push(`${v} ${nm(e.q)} plays the same nights, some of them at ${e.pts < 0 ? "a spot where he scores less" : "a spot where he scores more"}`);
     else if (e.pts < 0) parts.push(`${v} ${nm(e.q)} sits ${-e.n} more night${e.n === -1 ? "" : "s"}`);
     else parts.push(`${v} ${nm(e.q)} plays ${e.n} more night${e.n === 1 ? "" : "s"}`);
   }
@@ -1888,7 +1965,7 @@ function drawSearch(box, R) {
       }).join("")}</div><p class="note" style="margin:6px 0 0">Tap a team to see all its offers. "Adds" already counts the free agents each team could pick up instead, so it's what he's really worth to them.</p>` : `<p class="note">No team gains much from him once you count what they could get off waivers for free.</p>`}</div>`;
   } else if (R.kind === "buy") {
     const c = R.ctx, ins = (R.get || []).filter((p) => c.a.r.includes(p)), st = lineupStarts(c.a.r, rosDays());
-    const plays = ins.map((p) => { const o = st.get(p.id); return o && o.games ? `${esc(p.n.split(" ").slice(-1)[0])} would be in your lineup about ${o.n} of his ${o.games} games` : ""; }).filter(Boolean).join("; ");
+    const plays = ins.map((p) => { const o = st.get(p.id); return o && o.games ? `${esc(p.n.split(" ").slice(-1)[0])} would be in your lineup about ${o.n} of his ${o.games} ${o.g ? "expected starts" : "games"}` : ""; }).filter(Boolean).join("; ");
     const room = c.a.dropped.length ? `; to make room you'd drop ${c.a.dropped.map((p) => esc(p.n)).join(" and ")}` : "";
     const cost = c.them >= 0
       ? `${esc(tname(R.T))} barely needs ${(R.get || []).length > 1 ? "them" : "him"}: losing ${(R.get || []).length > 1 ? "them" : "him"} costs them nothing by our numbers (${sgn(c.them)}, since they'd fill the spot off waivers), so don't overpay.`
@@ -2215,7 +2292,8 @@ function cardHTML(p, rank, key, owner, wk) {
 }
 function detailHTML(p) {
   const parts = [];
-  const why = (p.ch || []).map(([tone, txt]) => `<li class="${tone}">${esc(txt)}</li>`).join("");
+  // the starts note was written before the season; once games are in, say so (the line above it has today's number)
+  const why = (p.ch || []).map(([tone, txt]) => `<li class="${tone}">${esc(p.slot === "G" && liveOf(p) && liveOf(p).tg ? txt.replace(/^We project about (\d+) starts for him\.$/, "Before the season we projected about $1 starts for him over the whole season.") : txt)}</li>`).join("");
   const v = valOf(p);
   let lead = "";
   if (v != null) {
@@ -2239,7 +2317,7 @@ function detailHTML(p) {
   if (hurt(p) || dtd(p)) lead = `<li class="bad">${esc(injWhat(p))}${hurt(p) && !(dtd(p) && !missedGames(p)) ? `: ${outForSeason(p) ? "<b>out for the season</b>" : `expected back around <b>${esc(dLabel(p.ret, { month: "short", day: "numeric" }))}</b>`}${missedGames(p) ? `, so he misses about ${missedGames(p)} of his team's games` : ""}` : ": he might miss a game"}.${ij ? ` From ESPN's NHL injury report (${esc(dLabel(ij.d, { month: "short", day: "numeric" }))}), checked several times a day; every projection on this site already counts it.` : ""}</li>` + lead;
   if (!p.unknown && p.gm > 0 && owners()[p.id]) {
     const ow = owners()[p.id], st = lineupStarts(rosterOf(ow), rosDays()).get(p.id);
-    if (st && st.games) lead += `<li class="info">${st.cut >= st.games * 0.9 ? (ow === S.team ? `When ${esc(backNames(ow))} ${backNames(ow).includes(" and ") ? "come" : "comes"} back you'll be over the 18-player limit, and he's the player your lineup would miss least, so he's the one to drop or trade.` : `${esc(tname(ow))} will be over the roster limit once its injured players return, and he's the player it would miss least, so he'd likely be cut.`) : `In ${ow === S.team ? "your" : esc(tname(ow)) + "'s"} lineup about <b>${st.n}</b> of his ${st.games} remaining games (${Math.round(st.pts)} points); the other nights he'd sit behind better players at his position.`}</li>`;
+    if (st && st.games) lead += `<li class="info">${st.cut >= st.games * 0.9 ? (ow === S.team ? `When ${esc(backNames(ow))} ${backNames(ow).includes(" and ") ? "come" : "comes"} back you'll be over the 18-player limit, and he's the player your lineup would miss least, so he's the one to drop or trade.` : `${esc(tname(ow))} will be over the roster limit once its injured players return, and he's the player it would miss least, so he'd likely be cut.`) : st.g ? `He's expected to start about <b>${st.games}</b> more game${st.games === 1 ? "" : "s"}, and ${ow === S.team ? "you'd" : esc(tname(ow)) + " would"} have a goalie spot for about <b>${st.n}</b> of them (${Math.round(st.pts)} points). You see who's starting before the lineup locks, so a goalie only sits when more than ${CAP.G} of ${ow === S.team ? "yours" : "theirs"} start the same night.` : `In ${ow === S.team ? "your" : esc(tname(ow)) + "'s"} lineup about <b>${st.n}</b> of his ${st.games} remaining games (${Math.round(st.pts)} points); the other nights he'd sit behind better players at his position.`}</li>`;
   }
   if (!p.unknown && p.gm > 0) {
     const nv = nextVal(p), af = ageF(p), ow = owners()[p.id], kp = ow ? keeperOf(p, ow) : null;
@@ -2342,7 +2420,7 @@ function renderLeague() {
         <div><div class="tn">${esc(x.t.name)}</div><div class="ts">${x.r.length - irN} players${irN ? ` + ${irN} on IR` : ""} · ${x.r.filter(hurt).length} hurt</div></div>
         <div class="tp"><b>${fmt(x.v)}</b><small>proj pts</small></div></button>
       <div class="meter"><i style="width:${(100 * x.v) / mx}%"></i></div>
-      ${open ? `<div class="body"><div class="mini mhead"><span></span><span>Player · nights in the lineup</span><b>Pts</b></div>${lines.map(([s, p, pts, st]) => `<div class="mini"><span class="pos">${s}</span><span>${esc(p.n)} <span class="note">${esc(p.t)}${hurt(p) ? " · hurt" : ""} · ${st.games ? (st.cut >= st.games * 0.9 ? "would be cut" : `${st.n} of ${st.games}`) : "no games"}</span></span><b>${fmt(pts)}</b></div>`).join("")}</div>` : ""}
+      ${open ? `<div class="body"><div class="mini mhead"><span></span><span>Player · nights in the lineup</span><b>Pts</b></div>${lines.map(([s, p, pts, st]) => `<div class="mini"><span class="pos">${s}</span><span>${esc(p.n)} <span class="note">${esc(p.t)}${hurt(p) ? " · hurt" : ""} · ${st.games ? (st.cut >= st.games * 0.9 ? "would be cut" : `${st.n} of ${st.games}${st.g ? " starts" : ""}`) : "no games"}</span></span><b>${fmt(pts)}</b></div>`).join("")}</div>` : ""}
     </div>`;
   }).join("")}</div>`;
   el.querySelectorAll("[data-team]").forEach((b) => (b.onclick = () => { S.leagueOpen[b.dataset.team] = !S.leagueOpen[b.dataset.team]; renderLeague(); }));
@@ -2467,6 +2545,7 @@ function renderHow() {
     <li><b>Once games start</b>, a refresh job pulls this season's stats from the NHL several times a day and moves every projection. How fast depends on the stat, tested on five past seasons: faceoffs and hits settle within a couple of weeks; goals barely count early because hot shooting streaks don't last. More ice time or a bigger power-play role adds on top. Breakout chances move with it: in testing, about 10 games in, players the update put at 40% or more broke out ${Math.round(100 * META.breakout.test.ins.g10.flag)}% of the time (${Math.round(100 * META.breakout.test.ins.g20.flag)}% by 20 games), while simply chasing a hot start (scoring 30% above his projection) worked ${Math.round(100 * META.breakout.test.ins.g10.hot)}% of the time (${Math.round(100 * META.breakout.test.ins.g20.hot)}% by 20 games).</li>
     <li><b>Pickups</b> give a small bonus for breakout upside (a quarter of the extra points a breakout usually brings, since you can drop him if it doesn't happen), so between two similar free agents the one with more upside ranks first.</li>
     <li><b>Who's getting the net:</b> each goalie's share of starts begins at the preseason guess and moves toward who has actually been starting, with recent games counting most (each game further back counts about 9% less, so the last two or three weeks matter most). A goalie who hasn't played at all loses share too. Tested on 11 past seasons, this beat a plain season-to-date update at 7 of 8 checkpoints. It still moves more slowly than a hot streak looks on purpose: backups who had started 4 of their team's last 5 around this point went on to make about half the starts the rest of the way, not all of them.</li>
+    <li><b>Goalies in your lineup:</b> a skater with a game plays, but a goalie only scores when he starts, and you can see who's starting before your lineup locks (a minute before each game). So the site doesn't just hand your 2 goalie spots to your 2 best goalies. Each night, every goalie of yours with a game has a chance to start (his share of his team's starts), and you play whichever ones do, up to 2. A 3rd or 4th goalie counts nearly every time he starts, because it's rare that 3 of yours start on the same night. Before Nov 12 the site gave the spots to the 2 best goalies every night, so extra goalies looked like free drops.</li>
     <li><b>Hurt goalies and crowded nets:</b> one goalie starts each game, so a team's healthy goalies can't add up to more than about 97% of its starts. When a goalie is out, the healthy ones split what's left after whoever else is starting (the refresh job records every team's starting goalie, game by game, so a call-up who's getting the net counts). When everyone is healthy and their shares add up to more than that, usually because a goalie just came back and his stand-ins piled up starts, all of them are scaled down to fit. Call-ups who are starting but aren't in this site's player list show up at the top of Pickups if they're free agents.</li>
     <li><b>Playing time:</b> every projection assumes a number of games. Once the season starts that moves with what he's actually played, quickly when he's playing more than expected (a rookie projected for 36 games who has played all 17) and slowly when he's playing less (a regular back from an injury mostly plays from here, but a bit less than planned). It's only done for players who are in the lineup now; the injury report covers the rest. Tested on five past seasons, it cut the miss on rest-of-season games played by about a fifth.</li>
     <li><b>Trades in the real NHL:</b> the refresh job checks every player's current team, so a traded player moves to his new team's schedule here and goalies are grouped with their real partners. His card says when he's moved.</li>
