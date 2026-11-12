@@ -39,6 +39,12 @@ OUT = os.environ.get("LIVE_OUT", os.path.join(ROOT, "docs", "data", "live.json")
 SEASON = os.environ.get("LIVE_SEASON", "20262027")
 K = {"g": 81.5, "a": 69.7, "pm": 105.8, "pim": 133.5, "hit": 17.5, "blk": 34.7, "fow": 8.2}
 ROLE = {"toi": 0.043, "pp": 0.033}
+# playing time (build/inseason_games.py, 2021-22..2025-26, players active in the last 10 days): the share of his team's
+# games he'll play from here = (K*preseason share + games played) / (K + team games). K is 6.5 team games when he's
+# playing more than expected (a rookie projected for 36 games who has played all 17 was still being valued at 36), and
+# 30.7 when he's playing less (a regular back from an injury mostly plays from here, but misses a bit more than
+# planned). Never raised past 84.6% unless the board already had him higher: even everyday players miss games.
+KA = {"up": 6.5, "down": 30.7, "cap": 0.846}
 KG = {"share": 23.2, "pps": 53.6}
 # start share with recent games counting more (build/inseason_goalie_recency.py, 2015-16..2025-26, LOSO):
 # share = (KD*prior + sum(d^k * started k games ago)) / (KD + sum(d^k)). Prior worth 11.6 team games, each older
@@ -256,6 +262,11 @@ def main():
             if d >= d10:
                 tg10[t] = tg10.get(t, 0) + 1
     y = (today - dt.timedelta(days=1)).isoformat()
+    played = {}  # team -> dates of its games so far
+    for d, idx in meta["sched"]["days"]:
+        if d < today.isoformat():
+            for i in idx:
+                played.setdefault(teams[i], []).append(d)
     # testing hook: replay a past season's stats up to a date (LIVE_SEASON + LIVE_THROUGH)
     thru = os.environ.get("LIVE_THROUGH")
     s_hi = thru or None
@@ -344,14 +355,36 @@ def main():
                 pr = sum(w(slot, c) * prior[c] for c in CATS)
                 po = sum(w(slot, c) * post[c] for c in CATS) + ROLE["toi"] * dtoi + ROLE["pp"] * dpp
                 if pr > 0.2:
-                    m[slot] = round(max(0.5, min(1.8, po / pr)), 4)
+                    m[slot] = max(0.5, min(1.8, po / pr))
+            gp10 = (recent.get(nid) or {}).get("gamesPlayed", 0)
+            # playing time: only for players in the lineup lately (the injury report covers the ones who aren't)
+            av, a0 = 1.0, min(1.0, gp0 / max(p.get("gm") or 82, 1))
+            tgn = sum(1 for d in played.get(team, []) if not p.get("ret") or d >= p["ret"])
+            if tgn >= 5 and a0 > 0 and gp10 > 0 and p["id"] not in out["inj"]:
+                gpn = min(n, tgn)
+                ka = KA["up"] if gpn / tgn >= a0 else KA["down"]
+                pa = (ka * a0 + gpn) / (ka + tgn)
+                av = max(0.5, min(2.2, min(pa, max(KA["cap"], a0)) / a0))
+            # A raise multiplies his per-game projection, and for a player projected for few games that number is
+            # shaky (a rookie's total came from where he was drafted, not from games). So a raise never lifts his
+            # per-game projection more than 10% above what he has actually scored per game at that position.
+            def raised(slot, v):
+                a = av
+                if a > 1 and n >= 8:
+                    pgm = (p["slotpts"][slot] / gp0) * v
+                    pgo = sum(w(slot, c) * tot[c] for c in CATS) / n
+                    if pgm > 1.1 * pgo:
+                        a = max(1.0, a * 1.1 * pgo / pgm)
+                return round(max(0.4, min(2.5, v * a)), 4)
+            m = {slot: raised(slot, v) for slot, v in m.items()}
             best = p["slot"] if p["slot"] in SK else next(iter(m), "W")
             fp = sum(w(best, c) * tot[c] for c in CATS)
             fps = {slot: round(sum(w(slot, c) * tot[c] for c in CATS), 1) for slot in m} if len(m) > 1 else None
             rec = {"m": m, "n": n, "fp": round(fp, 1), "toi": round(t_now, 1), "dtoi": round(dtoi, 2), "pp": round(pp_now, 2), "dpp": round(dpp, 2), "tg": tg.get(team, 0)}
             if fps:
                 rec["fps"] = fps  # what he has scored at each position he can play (faceoffs only count at center)
-            gp10 = (recent.get(nid) or {}).get("gamesPlayed", 0)
+            if abs(av - 1) >= 0.005:
+                rec["av"] = round(av, 3)  # the playing-time part of m (m / av is the per-game part)
         # sitting out: his team played 3+ games in the last 10 days and he played none
         if tg10.get(team, 0) >= 3 and gp10 == 0:
             rec["out"] = tg10.get(team, 0)
