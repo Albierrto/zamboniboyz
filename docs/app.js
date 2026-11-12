@@ -123,7 +123,10 @@ function ptsAt(p, s) {
 const MKT = { on: false };
 let LIVE = null; // docs/data/live.json: season-to-date updates written by the refresh job
 function liveOf(p) { return (LIVE && LIVE.players && LIVE.players[p.id]) || null; }
-function liveMult(p) { const l = liveOf(p); if (!l || !l.m) return null; const v = l.m[p.slot] ?? Object.values(l.m)[0]; return v == null ? null : v; }
+// how far his projection has moved this season. For a player with two positions it's read at the one where he's worth
+// the most against today's waiver level (Byfield's wing number was down 11% while his center number, where his
+// faceoffs count and where a lineup uses him, was up 8%).
+function liveMult(p) { const l = liveOf(p); if (!l || !l.m) return null; const ks = Object.keys(l.m); const v = (ks.length > 1 ? l.m[valSlot(p)] : null) ?? l.m[p.slot] ?? l.m[ks[0]]; return v == null ? null : v; }
 // breakout chance: preseason model, updated by how much his projection has moved since (tested on 5 past seasons)
 // Veterans beat their projection by 30% about as often as young players (build/breakout_age.py), but with about
 // the same ice time and they keep less of it the season after, so for them it's called a big year, not a breakout.
@@ -155,7 +158,7 @@ function trendTag(p) {
 }
 function outTag(p) { const l = liveOf(p); return l && l.out ? `<span class="pill bad" title="His team played ${l.out} games in the last 10 days and he played none">Not playing lately</span>` : ""; }
 const RC = new Map(), EC = new Map();
-function clearCaches() { MEMO.clear(); RC.clear(); EC.clear(); GL.clear(); NL.clear(); ORD.clear(); NM.clear(); MSC.v = -1; GSS.o = null; }
+function clearCaches() { MEMO.clear(); RC.clear(); EC.clear(); GL.clear(); NL.clear(); ORD.clear(); NM.clear(); MGC.clear(); GSS.o = null; }
 function rateAt(p, s) {
   const k = p.id + s + (MKT.on ? "m" : "");
   let r = RC.get(k);
@@ -244,6 +247,24 @@ function injTag(p, short) {
   if (hurt(p)) return `<span class="pill bad" title="${esc(injWhat(p))}${when ? (outForSeason(p) ? ". Out for the season" : `. Expected back around ${esc(when)}`) : ""}">${short ? word : outForSeason(p) ? `${word}: out for season` : `${word} until ${esc(when)}`}</span>`;
   return "";
 }
+// players who changed NHL teams after the board was built (live.json "tm": {id: team now}): move them, so their
+// schedule, their goalie partners and the team shown are right. t0 keeps the team the projection was built for.
+// season points so far; for a player who can play center or wing, both, because faceoff wins only count at center
+function seasonPtsText(lv) {
+  const f = lv.fps, ks = f ? Object.keys(f) : [];
+  if (ks.length > 1 && Math.abs(f[ks[0]] - f[ks[1]]) >= Math.max(3, 0.1 * Math.max(f[ks[0]], f[ks[1]]))) {
+    const hi = ks.slice().sort((a, b) => f[b] - f[a]);
+    return `${fmt(f[hi[0]])} fantasy points as a ${POSNAME[hi[0]].toLowerCase()} (${fmt(f[hi[1]])} as a ${POSNAME[hi[1]].toLowerCase()}: faceoff wins only count at center, and wingers get more for goals and assists)`;
+  }
+  return `${fmt(lv.fp)} fantasy points`;
+}
+function applyTeams() {
+  const tm = (LIVE && LIVE.tm) || {};
+  for (const p of B.players) {
+    if (p.t0 === undefined) p.t0 = p.t || "";
+    p.t = tm[p.id] || p.t0;
+  }
+}
 function applyInjuries() {
   const inj = (LIVE && LIVE.inj) || {}, back = new Set((LIVE && LIVE.back) || []);
   for (const p of B.players) {
@@ -255,40 +276,60 @@ function applyInjuries() {
   }
   buildGoalieBoost();
 }
-// A goalie hurt after the preseason build: on the nights he's out, his share of starts is split among his healthy
-// teammates on the board and whoever else the team calls up (weight GX0 for "someone not on the board"), weighted by
-// their normal shares. That guess is then corrected by who has actually started since he went down (live.json "gst":
-// every team's starting goalie game by game, call-ups included), counting the guess as GP games. Each goalie is only
-// judged on games he was healthy for. So a third-stringer doesn't inherit a starter's job unless he's really starting.
-const GX0 = 0.08, GP = 4, GKS = 23.2;  // GKS: the old flat prior weight, only used if live.json has no "sh" (start share)
+// One goalie starts each game, so on any night a team's healthy goalies can't add up to more than about 97% of the
+// starts (the rest is call-ups and emergencies). Each goalie's share is the refresh job's number (live.json "sh":
+// preseason share moved toward who has actually been starting), or his preseason share if he hasn't played. Then:
+//  - Everyone healthy and the shares add up to more than 97%: all are scaled down to fit. This happens when a goalie
+//    comes back from injury: the ones who covered for him piled up starts they won't keep. (Tested on 63 past cases of
+//    a goalie with a 30%+ share returning in the first half: without the cap both he and his stand-ins were projected
+//    6 to 11 points of share too high; the cap removed about a third of that and lowered the error for both.)
+//  - Someone is out: the healthy ones split what's left after whoever else is starting. "Whoever else" (a call-up who
+//    isn't in this site's player list) starts from a small guess, GX0, and is corrected by who has really started
+//    since the hurt goalie's last game (live.json "gst", the guess counting as GP games). So a third-stringer doesn't
+//    inherit a starter's job when a call-up is playing, and a tandem partner doesn't get more than there is to give.
+// Before 2026-11-11 the extra went on top of each goalie's own count of starts with only GP games of caution, which
+// counted this season's starts a second time (Cam Talbot got 1.41x, more than a goalie who starts more often).
+const GX0 = 0.08, GP = 4, GKS = 23.2, GCAP = 0.97;  // GKS: the old flat prior weight, only used if live.json has no "sh"
 let GBM = new Map();
+function goalieShare(q) {
+  const sh = q.gs / q.gm, lv = liveOf(q);
+  return lv && lv.sh != null ? lv.sh : lv && lv.tg ? (GKS * sh + (lv.gs || 0)) / (GKS + lv.tg) : sh;
+}
 function buildGoalieBoost() {
   GBM = new Map();
   const byTeam = {}, GST = (LIVE && LIVE.gst) || {};
   for (const p of B.players) if (p.slot === "G" && p.t && p.gm > 0 && p.gs > 0) (byTeam[p.t] = byTeam[p.t] || []).push(p);
   const t0 = todayET();
   for (const [t, gs] of Object.entries(byTeam)) {
-    const late = gs.filter((g) => g.ret && (!g.ret0 || g.ret > g.ret0));
-    if (!late.length) continue;
-    // evidence: this team's games after the last start by any of the hurt goalies
-    const lateP = new Set(late.map((g) => g.pid).filter(Boolean)), games = GST[t] || [];
-    let i0 = 0; games.forEach((g, i) => { if (lateP.has(g[1])) i0 = i + 1; });
-    const ev = games.slice(i0);
+    const base = new Map(gs.map((q) => [q.id, goalieShare(q)]));
+    const games = GST[t] || [], mine = new Set(gs.map((g) => g.pid).filter(Boolean)), seenA = new Map();
     for (const day of DAYS) {
       if (day.d < t0 || !day.teams.has(t)) continue;
-      const lost = late.filter((g) => day.d < g.ret && (!g.ret0 || day.d >= g.ret0)).reduce((a, g) => a + g.gs / g.gm, 0);
-      if (!lost) continue;
-      const healthy = gs.filter((q) => plays(q, day));
-      const tot = healthy.reduce((a, q) => a + q.gs / q.gm, 0);
-      for (const q of healthy) {
-        const sh = q.gs / q.gm, guess = Math.min(0.9, sh + (lost * sh) / (tot + GX0));
-        const seen = ev.filter((g) => !(q.ret && g[0] < q.ret)), c = seen.filter((g) => g[1] === q.pid).length;
-        const nsh = Math.min(0.9, (GP * guess + c) / (GP + seen.length));
-        // the refresh job's multiplier already moved his share toward his starts this season (live.json "sh"), so
-        // divide that part out: otherwise the same starts would count twice
-        const lv = liveOf(q), post = lv && lv.sh != null ? lv.sh : lv && lv.tg ? (GKS * sh + (lv.gs || 0)) / (GKS + lv.tg) : sh;
+      const H = gs.filter((q) => plays(q, day)), A = gs.filter((q) => q.ret && day.d < q.ret);
+      const sH = H.reduce((a, q) => a + base.get(q.id), 0), sA = A.reduce((a, q) => a + base.get(q.id), 0);
+      if (!H.length || !(sH > 0)) continue;
+      let scale = 1;
+      if (!A.length) { if (sH > GCAP) scale = GCAP / sH; }
+      else {
+        const ak = A.map((q) => q.id).join(",");
+        let off = seenA.get(ak);
+        if (off === undefined) {
+          // who else has been starting since the hurt goalies' last start: anyone not in this team's list here
+          const ap = new Set(A.map((g) => g.pid).filter(Boolean));
+          let i0 = 0; games.forEach((g, i) => { if (ap.has(g[1])) i0 = i + 1; });
+          const ev = games.slice(i0), n = ev.filter((g) => !mine.has(g[1])).length;
+          const o0 = (sA * GX0) / (sH + GX0) + Math.max(0, 1 - sH - sA);
+          off = (GP * o0 + n) / (GP + ev.length);
+          seenA.set(ak, off);
+        }
+        scale = Math.max(0, GCAP - off) / sH;
+      }
+      for (const q of H) {
+        const b = base.get(q.id); if (!(b > 0)) continue;
+        const m = Math.min(scale, 0.9 / b);
+        if (Math.abs(m - 1) < 0.005) continue;
         if (!GBM.has(q.id)) GBM.set(q.id, new Map());
-        GBM.get(q.id).set(day.d, nsh / post);
+        GBM.get(q.id).set(day.d, m);
       }
     }
   }
@@ -467,14 +508,49 @@ function marginals(list, days) {
   }
   return m;
 }
-// each player's usefulness on his real team (computed once per team); a free agent being added counts as kept
-const MSC = { v: -1, m: new Map(), teams: new Set() };
-function msOf(p) {
-  if (MSC.v !== ROV) { MSC.v = ROV; MSC.m = new Map(); MSC.teams = new Set(); }
-  const ow = owners()[p.id];
-  if (!ow) return Infinity;
-  if (!MSC.teams.has(ow)) { MSC.teams.add(ow); for (const [id, x] of marginals(rosterOf(ow), rosDays())) MSC.m.set(id, x); }
-  return MSC.m.get(p.id) ?? 0;
+// Who gets cut, one at a time: take out the player the lineup misses least, then re-check everyone left, because once
+// two spare goalies are gone the last backup is suddenly needed (ranking everyone once, by what each adds alone, cut a
+// 3rd and a 4th goalie together and sometimes the 2nd with them). It's worked out on the roster being tested, not the
+// team's real one, so a deal that sends away a starter makes his backup worth keeping. Players coming in (a trade or
+// a pickup, the `keep` set) are never cut: a team adds someone to play him. Returns keep-priority by id; the first
+// player cut ranks lowest, and players who never play in these days rank below everyone.
+function cutOrder(list, days, keep) {
+  const cap = META.roster.max, irs = (META.rules && META.rules.irSlots) || 4;
+  let need = 0;
+  for (const day of days) {
+    let h = 0, hurtN = 0;
+    for (const p of list) { if (p.ret && day.d < p.ret) hurtN++; else h++; }
+    need = Math.max(need, h - (cap - Math.max(0, hurtN - irs)));
+  }
+  const last = days.length ? days[days.length - 1].d : "";
+  const out = new Map();
+  // goalies and skaters never take each other's lineup spots, so each group's numbers depend only on that group:
+  // work them out separately and reuse them (a deal that only moves skaters doesn't redo the goalies, and vice versa)
+  let G = [], K = [];
+  for (const p of list) { if (p.ret && last && last < p.ret) out.set(p.id, -1000); else (p.slot === "G" ? G : K).push(p); }
+  const steps = Math.max(0, Math.min(6, need + 1));
+  let mG = groupMarg(G, days), mK = groupMarg(K, days);
+  const low = (L, m) => { let lo = null; for (const p of L) { if (keep && keep.has(p.id)) continue; if (!lo || m.get(p.id) < m.get(lo.id) || (m.get(p.id) === m.get(lo.id) && p.id < lo.id)) lo = p; } return lo; };
+  for (let k = 0; k < steps; k++) {
+    const a = low(G, mG), b = low(K, mK);
+    if (!a && !b) break;
+    const isG = a && (!b || mG.get(a.id) < mK.get(b.id) || (mG.get(a.id) === mK.get(b.id) && a.id < b.id));
+    const lo = isG ? a : b;
+    out.set(lo.id, k - 100);
+    if (isG) { G = G.filter((p) => p !== lo); if (k + 1 < steps) mG = groupMarg(G, days); }
+    else { K = K.filter((p) => p !== lo); if (k + 1 < steps) mK = groupMarg(K, days); }
+  }
+  for (const p of G) out.set(p.id, mG.get(p.id) ?? 0);
+  for (const p of K) out.set(p.id, mK.get(p.id) ?? 0);
+  return out;
+}
+const MGC = new Map();
+function groupMarg(L, days) {
+  if (!L.length) return new Map();
+  const key = L.map((p) => p.id).sort().join(",") + "|" + (days.length ? days[0].d + ":" + days.length : "");
+  let m = MGC.get(key);
+  if (!m) { m = marginals(L, days); if (MGC.size > 60000) MGC.clear(); MGC.set(key, m); }
+  return m;
 }
 function rosterOrder(roster) {
   const key = roster.map((p) => p.id).sort().join(",");
@@ -482,13 +558,13 @@ function rosterOrder(roster) {
   if (R) return R;
   const byKeep = (a, b) => b[1] - a[1] || (a[0].id < b[0].id ? -1 : 1);
   if (!CAPX.off && roster.length > META.roster.max && overLimit(roster, rosDays())) {
-    // the roster's own team is whoever owns most of it. Players coming in (a trade or a pickup) count as kept, like a
-    // free agent: a team trades for someone to play him, so its cuts come from its own players. Before this, a
-    // traded-in player was ranked by how useful he was on his OLD team, so a starter buried on a deep roster got cut.
+    // the roster's own team is whoever owns most of it; anyone else on it is coming in and counts as kept
     const own = owners(), cnt = {};
     for (const p of roster) { const o = own[p.id]; if (o) cnt[o] = (cnt[o] || 0) + 1; }
     const home = Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a])[0];
-    R = roster.map((p) => [p, own[p.id] === home ? msOf(p) : Infinity]).sort(byKeep).map((x) => x[0]);
+    const keep = new Set(roster.filter((p) => own[p.id] !== home).map((p) => p.id));
+    const co = cutOrder(roster, rosDays(), keep);
+    R = roster.map((p) => [p, keep.has(p.id) ? Infinity : co.get(p.id) ?? 0]).sort(byKeep).map((x) => x[0]);
   }
   else R = roster.map((p) => [p, keepVal(p)]).sort(byKeep).map((x) => x[0]);
   if (ORD.size > 20000) ORD.clear();
@@ -2154,7 +2230,8 @@ function detailHTML(p) {
   const bpd = boP(p);
   if (bpd != null) lead += `<li class="good">${isVet(p) ? "Big-year" : "Breakout"} chance: <b>${Math.round(100 * bpd)}%</b> that he beats his projection by 30% or more and ends up worth a roster spot (typical for a player projected like him: ${Math.round(100 * p.bo[1])}%).${isVet(p) ? vetNote(p) : ""}${p.bw && p.bw.length ? " Why: " + p.bw.map(esc).join("; ") + "." : ""}</li>`;
   const lv = liveOf(p);
-  if (lv && lv.n) lead += `<li class="info">This season so far: ${lv.n} game${lv.n === 1 ? "" : "s"}, ${fmt(lv.fp)} fantasy points${lv.toi ? `, ${fmt(lv.toi, 1)} min a game` : ""}${lv.pp ? ` (${fmt(lv.pp, 1)} on the power play)` : ""}. His projection has moved ${sgn(100 * ((liveMult(p) || 1) - 1))}% since the season started.</li>`;
+  if (p.t0 !== undefined && p.t !== p.t0) lead += `<li class="info">He's with ${esc(p.t)} now${p.t0 ? ` (traded from ${esc(p.t0)})` : ""}. His schedule here follows ${esc(p.t)}; his projection was built before the move, and it shifts as he plays.</li>`;
+  if (lv && lv.n) lead += `<li class="info">This season so far: ${lv.n} game${lv.n === 1 ? "" : "s"}, ${seasonPtsText(lv)}${lv.toi ? `, ${fmt(lv.toi, 1)} min a game` : ""}${lv.pp ? ` (${fmt(lv.pp, 1)} on the power play)` : ""}. His projection has moved ${sgn(100 * ((liveMult(p) || 1) - 1))}% since the season started.</li>`;
   const ij = injOf(p);
   if (hurt(p) || dtd(p)) lead = `<li class="bad">${esc(injWhat(p))}${hurt(p) && !(dtd(p) && !missedGames(p)) ? `: ${outForSeason(p) ? "<b>out for the season</b>" : `expected back around <b>${esc(dLabel(p.ret, { month: "short", day: "numeric" }))}</b>`}${missedGames(p) ? `, so he misses about ${missedGames(p)} of his team's games` : ""}` : ": he might miss a game"}.${ij ? ` From ESPN's NHL injury report (${esc(dLabel(ij.d, { month: "short", day: "numeric" }))}), checked several times a day; every projection on this site already counts it.` : ""}</li>` + lead;
   if (!p.unknown && p.gm > 0 && owners()[p.id]) {
@@ -2387,7 +2464,8 @@ function renderHow() {
     <li><b>Once games start</b>, a refresh job pulls this season's stats from the NHL several times a day and moves every projection. How fast depends on the stat, tested on five past seasons: faceoffs and hits settle within a couple of weeks; goals barely count early because hot shooting streaks don't last. More ice time or a bigger power-play role adds on top. Breakout chances move with it: in testing, about 10 games in, players the update put at 40% or more broke out ${Math.round(100 * META.breakout.test.ins.g10.flag)}% of the time (${Math.round(100 * META.breakout.test.ins.g20.flag)}% by 20 games), while simply chasing a hot start (scoring 30% above his projection) worked ${Math.round(100 * META.breakout.test.ins.g10.hot)}% of the time (${Math.round(100 * META.breakout.test.ins.g20.hot)}% by 20 games).</li>
     <li><b>Pickups</b> give a small bonus for breakout upside (a quarter of the extra points a breakout usually brings, since you can drop him if it doesn't happen), so between two similar free agents the one with more upside ranks first.</li>
     <li><b>Who's getting the net:</b> each goalie's share of starts begins at the preseason guess and moves toward who has actually been starting, with recent games counting most (each game further back counts about 9% less, so the last two or three weeks matter most). A goalie who hasn't played at all loses share too. Tested on 11 past seasons, this beat a plain season-to-date update at 7 of 8 checkpoints. It still moves more slowly than a hot streak looks on purpose: backups who had started 4 of their team's last 5 around this point went on to make about half the starts the rest of the way, not all of them.</li>
-    <li><b>Hurt goalies:</b> when a goalie gets hurt during the season, his starts are split among his healthy teammates and whoever the team calls up, then checked against who has actually started since (the refresh job records every team's starting goalie, game by game). So a third-stringer doesn't inherit a starter's job unless he's really getting the starts. Call-ups who are starting but aren't in this site's player list show up at the top of Pickups if they're free agents.</li>
+    <li><b>Hurt goalies and crowded nets:</b> one goalie starts each game, so a team's healthy goalies can't add up to more than about 97% of its starts. When a goalie is out, the healthy ones split what's left after whoever else is starting (the refresh job records every team's starting goalie, game by game, so a call-up who's getting the net counts). When everyone is healthy and their shares add up to more than that, usually because a goalie just came back and his stand-ins piled up starts, all of them are scaled down to fit. Call-ups who are starting but aren't in this site's player list show up at the top of Pickups if they're free agents.</li>
+    <li><b>Trades in the real NHL:</b> the refresh job checks every player's current team, so a traded player moves to his new team's schedule here and goalies are grouped with their real partners. His card says when he's moved.</li>
     <li><b>Not playing lately</b> means his team played 3 or more games in the last 10 days and he didn't play: usually an injury or healthy scratch.</li>
   </ul>
   <h3>Words you'll see</h3>
@@ -2566,7 +2644,7 @@ async function loadLive() {
       if (!r.ok) continue;
       const d = await r.json();
       if (!d || !d.players) continue;
-      if (!LIVE || d.generated !== LIVE.generated) { LIVE = d; applyInjuries(); clearCaches(); S.lastSig = ""; afterSync(); }
+      if (!LIVE || d.generated !== LIVE.generated) { LIVE = d; applyTeams(); applyInjuries(); clearCaches(); S.lastSig = ""; afterSync(); }
       return;
     } catch (e) { /* try the next copy */ }
   }
