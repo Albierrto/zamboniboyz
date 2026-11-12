@@ -142,7 +142,8 @@ function boP(p) {
   const p0 = Math.min(0.97, Math.max(0.01, p.bo[0]));
   const l = liveOf(p), m = liveMult(p);
   let z = Math.log(p0 / (1 - p0));
-  if (l && m && l.n) z += META.breakout.chg * Math.log(m) * (l.n / (l.n + 5));
+  // the breakout test was fitted on the per-game part of the update, so the playing-time part (l.av) is taken out
+  if (l && m && l.n) z += META.breakout.chg * Math.log(m / (l.av || 1)) * (l.n / (l.n + 5));
   return 1 / (1 + Math.exp(-z));
 }
 function trendTag(p) {
@@ -152,6 +153,8 @@ function trendTag(p) {
   if (l.dtoi >= 1) why.push(`+${l.dtoi.toFixed(1)} min ice time`);
   if (l.dpp >= 0.5) why.push(`+${l.dpp.toFixed(1)} min power play`);
   if (l.dtoi <= -1) why.push(`${l.dtoi.toFixed(1)} min ice time`);
+  if (l.av >= 1.08) why.push("playing more games than expected");
+  if (l.av <= 0.93) why.push("has missed more games than expected");
   if (m >= 1.08) return `<span class="pill good" title="${esc(why.join(", ") || "Scoring above his projection so far")}">Trending up ${Math.round(100 * (m - 1))}%</span>`;
   if (m <= 0.92) return `<span class="pill bad" title="${esc(why.join(", ") || "Scoring below his projection so far")}">Trending down ${Math.round(100 * (1 - m))}%</span>`;
   return "";
@@ -2231,7 +2234,7 @@ function detailHTML(p) {
   if (bpd != null) lead += `<li class="good">${isVet(p) ? "Big-year" : "Breakout"} chance: <b>${Math.round(100 * bpd)}%</b> that he beats his projection by 30% or more and ends up worth a roster spot (typical for a player projected like him: ${Math.round(100 * p.bo[1])}%).${isVet(p) ? vetNote(p) : ""}${p.bw && p.bw.length ? " Why: " + p.bw.map(esc).join("; ") + "." : ""}</li>`;
   const lv = liveOf(p);
   if (p.t0 !== undefined && p.t !== p.t0) lead += `<li class="info">He's with ${esc(p.t)} now${p.t0 ? ` (traded from ${esc(p.t0)})` : ""}. His schedule here follows ${esc(p.t)}; his projection was built before the move, and it shifts as he plays.</li>`;
-  if (lv && lv.n) lead += `<li class="info">This season so far: ${lv.n} game${lv.n === 1 ? "" : "s"}, ${seasonPtsText(lv)}${lv.toi ? `, ${fmt(lv.toi, 1)} min a game` : ""}${lv.pp ? ` (${fmt(lv.pp, 1)} on the power play)` : ""}. His projection has moved ${sgn(100 * ((liveMult(p) || 1) - 1))}% since the season started.</li>`;
+  if (lv && lv.n) lead += `<li class="info">This season so far: ${lv.n} game${lv.n === 1 ? "" : "s"}, ${seasonPtsText(lv)}${lv.toi ? `, ${fmt(lv.toi, 1)} min a game` : ""}${lv.pp ? ` (${fmt(lv.pp, 1)} on the power play)` : ""}. His projection has moved ${sgn(100 * ((liveMult(p) || 1) - 1))}% since the season started.${lv.av && p.gp && p.gm ? ` Part of that is playing time: the projection expected him in about ${Math.round((100 * p.gp) / p.gm)}% of his team's games, and he's played ${lv.n} of ${lv.tg}.` : ""}</li>`;
   const ij = injOf(p);
   if (hurt(p) || dtd(p)) lead = `<li class="bad">${esc(injWhat(p))}${hurt(p) && !(dtd(p) && !missedGames(p)) ? `: ${outForSeason(p) ? "<b>out for the season</b>" : `expected back around <b>${esc(dLabel(p.ret, { month: "short", day: "numeric" }))}</b>`}${missedGames(p) ? `, so he misses about ${missedGames(p)} of his team's games` : ""}` : ": he might miss a game"}.${ij ? ` From ESPN's NHL injury report (${esc(dLabel(ij.d, { month: "short", day: "numeric" }))}), checked several times a day; every projection on this site already counts it.` : ""}</li>` + lead;
   if (!p.unknown && p.gm > 0 && owners()[p.id]) {
@@ -2465,6 +2468,7 @@ function renderHow() {
     <li><b>Pickups</b> give a small bonus for breakout upside (a quarter of the extra points a breakout usually brings, since you can drop him if it doesn't happen), so between two similar free agents the one with more upside ranks first.</li>
     <li><b>Who's getting the net:</b> each goalie's share of starts begins at the preseason guess and moves toward who has actually been starting, with recent games counting most (each game further back counts about 9% less, so the last two or three weeks matter most). A goalie who hasn't played at all loses share too. Tested on 11 past seasons, this beat a plain season-to-date update at 7 of 8 checkpoints. It still moves more slowly than a hot streak looks on purpose: backups who had started 4 of their team's last 5 around this point went on to make about half the starts the rest of the way, not all of them.</li>
     <li><b>Hurt goalies and crowded nets:</b> one goalie starts each game, so a team's healthy goalies can't add up to more than about 97% of its starts. When a goalie is out, the healthy ones split what's left after whoever else is starting (the refresh job records every team's starting goalie, game by game, so a call-up who's getting the net counts). When everyone is healthy and their shares add up to more than that, usually because a goalie just came back and his stand-ins piled up starts, all of them are scaled down to fit. Call-ups who are starting but aren't in this site's player list show up at the top of Pickups if they're free agents.</li>
+    <li><b>Playing time:</b> every projection assumes a number of games. Once the season starts that moves with what he's actually played, quickly when he's playing more than expected (a rookie projected for 36 games who has played all 17) and slowly when he's playing less (a regular back from an injury mostly plays from here, but a bit less than planned). It's only done for players who are in the lineup now; the injury report covers the rest. Tested on five past seasons, it cut the miss on rest-of-season games played by about a fifth.</li>
     <li><b>Trades in the real NHL:</b> the refresh job checks every player's current team, so a traded player moves to his new team's schedule here and goalies are grouped with their real partners. His card says when he's moved.</li>
     <li><b>Not playing lately</b> means his team played 3 or more games in the last 10 days and he didn't play: usually an injury or healthy scratch.</li>
   </ul>
