@@ -1000,6 +1000,18 @@ function slotDist() {
   });
 }
 function pickDist(pk) { const d = slotDist(); return (pk.r === 1 ? d.r1 : d.rest)[pk.orig] || null; }
+// each team's chance to make the playoffs, from the same simulated standings that place the picks
+function playoffOdds(team) {
+  const r = slotDist().rest[team]; if (!r) return 0.5;
+  const np = KR.playoffTeams || 7; let p = 0;
+  for (let i = r.length - np; i < r.length; i++) p += r[i];
+  return Math.max(0, Math.min(1, p));
+}
+// How another team weighs this season against next (2026-11-17). A team in the race plays for now; a team out of
+// it plays for next year. Before, every other team was judged as a contender (this season + half of next), so the
+// site kept offering a last-place team a 32-year-old for its top-5 pick. A sure playoff team: this season x1, next
+// x0.5 (as before). A team with no chance: this season x0.15, next x1.
+function teamW(team) { const p = playoffOdds(team); return { now: 0.15 + 0.85 * p, next: 0.5 + 0.5 * (1 - p), p }; }
 function pickValue(pk) {
   const d = slotDist();
   if (!d.pv.has(pk.k)) {
@@ -1050,12 +1062,13 @@ function evalTrade(me, them, give, get, pg, pr) {
   }
   const w = horW(), wn = horN(), w2 = horW2();
   // the season after (keepers with two years of aging): only when building for later
-  const k2Me = w2 ? keeperSet(a.r, 2).v - keeperSet(A, 2).v : 0, k2Them = w2 ? keeperSet(b.r, 2).v - keeperSet(Bt, 2).v : 0;
-  // the other team is judged the usual way (this season plus half of next): you can't assume they're rebuilding too
-  const totThem = w2 ? nowThem + 0.5 * (kThem + pThem) : nowThem + w * (kThem + pThem);
+  const k2Me = w2 ? keeperSet(a.r, 2).v - keeperSet(A, 2).v : 0, k2Them = keeperSet(b.r, 2).v - keeperSet(Bt, 2).v;
+  // the other team weighs this season and next by its own playoff chances (teamW), whatever horizon you picked, and
+  // counts its keepers' value the season after at half of next season's weight (a keeper league: youth lasts)
+  const tw = teamW(them), totThem = tw.now * nowThem + tw.next * (kThem + pThem + 0.5 * k2Them);
   return { me: wn * nowMe + w * (kMe + pMe) + w2 * k2Me, them: totThem, nowMe, nowThem, nxMe: kMe + pMe, nxThem: kThem + pThem, kMe, kThem, pMe, pThem, k2Me, k2Them, a, b };
 }
-function tradeView(me, them, give, get, pg, pr) { return { ...evalTrade(me, them, give, get, pg, pr), ratio: nameRatio(give, get, pg, pr) }; }
+function tradeView(me, them, give, get, pg, pr) { return { ...evalTrade(me, them, give, get, pg, pr), ratio: lookRatio(give, get, pg, pr, them) }; }
 function mkDeal(team, give, get, pg, pr, r, ratio) {
   return { team, give, get, pg: pg || [], pr: pr || [], ratio, me: r.me, them: r.them, nowMe: r.nowMe, nowThem: r.nowThem, nxMe: r.nxMe, nxThem: r.nxThem, kMe: r.kMe, kThem: r.kThem, pMe: r.pMe, pThem: r.pThem, k2Me: r.k2Me, k2Them: r.k2Them, a: r.a, b: r.b, dropMe: r.a.dropped, addMe: r.a.added, dropThem: r.b.dropped, addThem: r.b.added };
 }
@@ -1097,7 +1110,7 @@ function tradeSearch(me, onProgress) {
         .map((p) => ({ p, g: evalTrade(me, T.id, [p], thWorst ? [thWorst] : []).them })).filter((x) => x.g > 3).sort((a, b) => b.g - a.g).slice(0, 7).map((x) => x.p);
       const theirPicks = picksOf(T.id).slice().sort((a, b) => pickValue(b) - pickValue(a)).slice(0, 4);
       const tryDeal = (give, get, pg, pr) => {
-        const ratio = nameRatio(give, get, pg, pr);
+        const ratio = lookRatio(give, get, pg, pr, T.id);
         if (ratio < FAIR || ratio > 2.2) return;   // they'd be overpaying, or you'd be giving far too much
         const r = evalTrade(me, T.id, give, get, pg, pr);
         if (r.me > 3) found.push(mkDeal(T.id, give, get, pg, pr, r, ratio));
@@ -1681,10 +1694,11 @@ function plist(ps, pks) {
 function mkLine(d) {
   const x = d.ratio;
   if (x == null) return "";
-  if (x >= 1.3) return "By name value (how the experts rank these players) they get a lot more than they give: you're paying above market. Fine if the fit is right, but you could ask for more.";
-  if (x >= 1.1) return "By name value (how the experts rank these players) they get more than they give, so it should look good to them.";
-  if (x >= 0.9) return "By name value (how the experts rank these players) it's about even, so it should look fair to them.";
-  return "By name value they give up a little more, so they may ask for a small extra.";
+  const how = "how they'd see these players (the experts' rankings moved toward this season's points, and whether they're playing for this year or next)";
+  if (x >= 1.3) return `By ${how}, they get a lot more than they give: you're paying above market. Fine if the fit is right, but you could ask for more.`;
+  if (x >= 1.1) return `By ${how}, they get more than they give, so it should look good to them.`;
+  if (x >= 0.9) return `By ${how}, it's about even, so it should look fair to them.`;
+  return `By ${how}, they give up a little more, so they may ask for a small extra.`;
 }
 function splitLine(d, who) {
   const now = who === "me" ? d.nowMe : d.nowThem, nx = who === "me" ? d.nxMe : d.nxThem;
@@ -1704,7 +1718,10 @@ function dealNotes(d) {
   for (const p of d.get) if (hurt(p)) notes.push(`${esc(p.n)} is hurt until about ${esc(dLabel(p.ret, { month: "short", day: "numeric" }))}; his number already leaves out the games he misses.`);
   for (const p of d.get) if (p.age >= 32 && nextVal(p) < rosOf(p) * 0.5) notes.push(`${esc(p.n)} is ${p.age}: players his age usually lose about ${Math.round(100 * (1 - ageF(p)))}% of their value by next season, so he's mostly a this-season piece.`);
   for (const p of d.give) if (p.age && p.age <= 23 && keeperOf(p, S.team)) notes.push(`${esc(p.n)} is ${p.age} and one of your keepers; players his age usually get a bit better next season.`);
-  if (d.ratio >= 1.3) notes.push("You're selling below market by name value. It still helps you, but another team might pay more.");
+  if (d.ratio >= 1.3) notes.push("You're selling below market. It still helps you, but another team might pay more.");
+  { const tw = teamW(d.team), pc = Math.round(100 * tw.p);
+    if (pc <= 25) notes.push(`${esc(tname(d.team))} ${pc <= 3 ? "is out of the playoff race" : `is about ${pc}% to make the playoffs`}, so they're playing for next season: this year's points count for little to them, and picks and young keepers for a lot.`);
+    else if (pc >= 80) notes.push(`${esc(tname(d.team))} is about ${pc}% to make the playoffs, so they're playing to win now.`); }
   notes.push(mkLine(d));
   return notes;
 }
@@ -1910,7 +1927,7 @@ async function deskSell(box, tok, give, pg) {
     let best = null;
     for (let si = 0; si < sets.length; si++) for (const pkg of pkgs) {
       const st = sets[si];
-      const ratio = nameRatio(st.g, pkg.g, st.p, pkg.p);
+      const ratio = lookRatio(st.g, pkg.g, st.p, pkg.p, T);
       if (ratio < FAIR) continue;
       const r = evalTrade(me, T, st.g, pkg.g, st.p, pkg.p);
       if (r.them < 3) continue;
@@ -1955,7 +1972,7 @@ async function deskBuy(box, tok, get, pr) {
   for (let si = 0; si < sets.length; si++) for (const pkg of (si === 0 ? pkgs.concat(big) : pkgs)) {
     const st = sets[si];
     if (++n % 40 === 0) { await tick(); if (tok !== DKTOK) return; }
-    const ratio = nameRatio(pkg.g, st.g, pkg.p, st.p);
+    const ratio = lookRatio(pkg.g, st.g, pkg.p, st.p, T);
     if (ratio < FAIR) continue;
     const r = evalTrade(me, T, pkg.g, st.g, pkg.p, st.p);
     if (r.them < 3) continue;
@@ -2070,7 +2087,7 @@ function evenIt(d) {
   const tryIt = (side, id, label, give, get, pg, pr) => {
     const r = evalTrade(me, T, give, get, pg, pr);
     if (r.me < 0 || r.them < 0) return;
-    const ratio = nameRatio(give, get, pg, pr);
+    const ratio = lookRatio(give, get, pg, pr, T);
     if (ratio < FAIR) return;
     opts.push({ side, id, label, me: r.me, them: r.them, gap: Math.abs(r.me - r.them) });
   };
@@ -2097,16 +2114,40 @@ function playScale(p) {
   if (p.slot === "G") return p.gs > 0 && p.gm > 0 && l && l.sh != null ? Math.min(2.5, gShareKeep(p) / (p.gs / p.gm)) : 1;
   return (l && l.av) || 1;
 }
-function lookBase(p) {
-  const g = playScale(p), x0 = ((p.mk != null && !p.rk ? p.mk : p.pts) || 0) * g, l = liveOf(p), r = REPL[p.slot] || 0;
-  let x = x0;
-  if (l && l.n >= 3 && l.fp != null && p.gp > 0) { const w = Math.min(0.5, l.n / 20); x = (1 - w) * x0 + w * (l.fp / l.n) * p.gp * g; }
-  const now = Math.max(0, x - r) * fracLeft();
-  const nx = p.gm > 0 ? Math.max(0, (x / p.gm) * 82 * ageF(p) - r) : 0;
-  return now + 0.5 * nx;
+function lookParts(p) {
+  const g = playScale(p), l = liveOf(p), base = (p.mk != null && !p.rk ? p.mk : p.pts) || 0, a = p.age || 28;
+  let best = null;
+  // a two-position player is seen at the position where he's worth most (Byfield: as a center, not a wing)
+  for (const s of p.slot === "G" ? ["G"] : elig(p)) {
+    const sp = p.slotpts && p.slotpts[s] != null && p.pts > 0 ? p.slotpts[s] / p.pts : 1, r = REPL[s] || 0;
+    let x = base * sp * g;
+    const fp = l && l.n >= 3 ? (l.fps && l.fps[s] != null ? l.fps[s] : l.fp) : null;
+    if (fp != null && p.gp > 0) { const w = Math.min(0.5, l.n / 20); x = (1 - w) * x + w * (fp / l.n) * p.gp * g; }
+    const now = Math.max(0, x - r) * fracLeft();
+    const nx = p.gm > 0 ? Math.max(0, (x / p.gm) * 82 * ageF(p) - r) : 0;
+    const nx2 = p.gm > 0 ? Math.max(0, (x / p.gm) * 82 * ageFAt(p, a) * ageFAt(p, a + 1) - r) : 0;
+    if (!best || now + 0.5 * (nx + 0.5 * nx2) > best[0] + 0.5 * (best[1] + 0.5 * best[2])) best = [now, nx, nx2];
+  }
+  return best || [0, 0, 0];
 }
-function lookSum(ps, pk) { return ps.reduce((t, p) => t + Math.pow(lookBase(p), 1.5), 0) + (pk || []).reduce((t, k) => t + mvalPick(k), 0); }
-function lookRatio(give, get, pg, pr) { const a = lookSum(give, pg), b = lookSum(get, pr); return b > 0 ? a / b : a > 0 ? 9 : 1; }
+function lookBase(p) { return lookFor(p, { now: 1, next: 0.5 }); }
+// How a deal looks to the other manager (2026-11-17: this is now the fairness check everywhere; it replaced the
+// preseason-only name value). Each player is the experts' preseason number moved toward this season's pace, above
+// waiver level; this season and next are weighed the way that team would (teamW); picks count at that team's
+// next-season weight; then everything to the power 1.5 so stars count for more than the sum of lesser players.
+// On the league's three in-season trades the side that gave more by this measure still got 80-84% (Hail Satan took
+// Montour for Harley + Dostal, Bald Machine took Knight + a 6th for Toews), while the old preseason name value had
+// those same trades at 2.7x, 4.1x and 0.17x.
+// a keeper league: the season after counts too, at half of next season's weight (a 22-year-old keeps his value,
+// a 33-year-old doesn't)
+const LOOKX = 1.5;  // star premium: 1.5 and 1.75 fit the league's real trades best (1, 2 and 2.5 were worse)
+function lookFor(p, w) { const [now, nx, nx2] = lookParts(p); return w.now * now + w.next * (nx + 0.5 * nx2); }
+function lookSum(ps, pk, team) {
+  const w = team ? teamW(team) : { now: 1, next: 0.5 };
+  // a pick is a player for next season and, if he's good, the season after too (same half weight as a player's)
+  return ps.reduce((t, p) => t + Math.pow(lookFor(p, w), LOOKX), 0) + (pk || []).reduce((t, k) => t + Math.pow(w.next * 1.5 * pickValue(k), LOOKX), 0);
+}
+function lookRatio(give, get, pg, pr, team) { const a = lookSum(give, pg, team), b = lookSum(get, pr, team); return b > 0 ? a / b : a > 0 ? 9 : 1; }
 function lookWord(x) { return x >= 1.05 ? ["good", "Looks like a win for them"] : x >= 0.85 ? ["good", "Looks fair to them"] : x >= 0.7 ? ["gold", "Looks a bit light to them"] : ["bad", "Looks light to them"]; }
 function paceNote(p) {
   const l = liveOf(p); if (!l || !l.n || l.n < 5 || !p.gp) return "";
@@ -2131,7 +2172,7 @@ async function deskWays(give, get, pg, pr, tok) {
   const me = S.team, T = deskState().team;
   const box0 = $("#dkWays"); if (!box0 || !T) return;
   const myR = rosterOf(me), keep = keeperSet(myR).keep, st = lineupStarts(myR, rosDays());
-  const ev = (g, t, a, b, x) => { const r = evalTrade(me, T, g, t, a, b); return { give: g, get: t, pg: a, pr: b, me: r.me, now: r.nowMe, nx: r.nxMe, k2: r.k2Me, them: r.them, look: lookRatio(g, t, a, b), ...x }; };
+  const ev = (g, t, a, b, x) => { const r = evalTrade(me, T, g, t, a, b); return { give: g, get: t, pg: a, pr: b, me: r.me, now: r.nowMe, nx: r.nxMe, k2: r.k2Me, them: r.them, look: lookRatio(g, t, a, b, T), ...x }; };
   const base = ev(give, get, pg, pr, { kind: "base" });
   const cand = myR.filter((p) => !onIR(p.id) && !give.includes(p) && !keep.has(p.id));
   const picks = picksOf(me).filter((k) => !pg.includes(k)).sort((a, b) => pickValue(a) - pickValue(b)).slice(0, 3);
