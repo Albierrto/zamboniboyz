@@ -38,6 +38,11 @@ function startTab() {  // everyone lands on My team once after the draft; after 
   if (!LS.get("zb-home1", false)) { LS.set("zb-home1", true); LS.set("zb-tab", "team"); return "team"; }
   const t = LS.get("zb-tab", "team"); return TABS.includes(t) ? t : "team";
 }
+// Calls the manager has made about a goalie's job, as season starts (the same thing the card's starts stepper sets).
+// A browser's own setting wins; "Back to our N" on the card stores null, which turns a call off on that browser.
+// 2026-11-17, Bort: treat Jacob Fowler as Montreal's starter. He had started 13 of their 21 games and 7 of the last 10;
+// the model had him at 46% of the rest. 50 starts = 62% of Montreal's 81 games, about his share so far.
+const GS_CALLS = { "068yz": 50 };
 const S = {
   team: startTeam(),
   tab: startTab(),
@@ -46,7 +51,7 @@ const S = {
   hor: ["now", "both", "next", "later"].includes(LS.get("zb-hor2", "later")) ? LS.get("zb-hor2", "later") : "later",
   addMode: LS.get("zb-addmode", "ros"), addPos: "ALL", addOpen: null, addShow: 25,
   stars: LS.get("zb-stars", {}),
-  gsOv: LS.get("zb-gs", {}),       // goalie id -> season starts
+  gsOv: { ...GS_CALLS, ...LS.get("zb-gs", {}) },  // goalie id -> season starts (null = back to the model's number)
   leagueOpen: {},
   live: { owners: null, status: null, at: null, err: null, fails: 0 },
   lastSig: "",
@@ -110,6 +115,8 @@ function elig0(p) {
   return k.sort((a, b) => (p.slotpts[b] - REPL[b]) - (p.slotpts[a] - REPL[a]));
 }
 function gsOf(p) { return S.gsOv[p.id] != null ? S.gsOv[p.id] : p.gs; }
+// a starts setting as a share of his team's games (null when there's none)
+function gsOvShare(q) { const v = S.gsOv[q.id]; return v != null && q.gm > 0 ? Math.min(0.9, v / q.gm) : null; }
 function ptsOf(p) {
   if (p.slot === "G" && S.gsOv[p.id] != null && p.gpg) return (p.gppg * S.gsOv[p.id]) / p.gpg;
   return p.pts;
@@ -166,10 +173,14 @@ function rateAt(p, s) {
   const k = p.id + s + (MKT.on ? "m" : "");
   let r = RC.get(k);
   if (r === undefined) {
-    const x = ptsAt(p, s);
-    r = p.gm > 0 && x != null ? x / p.gm : 0;
     const lv = LIVE && LIVE.players && LIVE.players[p.id];
+    // a goalie's live number already has this season's share of starts in it (live.json "sh"), so a starts setting
+    // replaces that share rather than stacking on it (before 2026-11-17 the two multiplied together)
+    const ovs = s === "G" ? gsOvShare(p) : null, swap = ovs != null && lv && lv.sh > 0 && lv.m && lv.m.G != null;
+    const x = swap ? p.pts : ptsAt(p, s);
+    r = p.gm > 0 && x != null ? x / p.gm : 0;
     if (lv && lv.m && lv.m[s] != null) r *= lv.m[s];
+    if (swap) r *= ovs / lv.sh;
     if (MKT.on && p.mk != null && p.pts > 0 && !p.rk) r *= p.mk / p.pts;
     RC.set(k, r);
   }
@@ -295,9 +306,15 @@ function applyInjuries() {
 const GX0 = 0.08, GP = 4, GKS = 23.2, GCAP = 0.97;  // GKS: the old flat prior weight, only used if live.json has no "sh"
 let GBM = new Map();
 function goalieShare(q) {
+  const ov = gsOvShare(q); if (ov != null) return ov;
   const sh = q.gs / q.gm, lv = liveOf(q);
   return lv && lv.sh != null ? lv.sh : lv && lv.tg ? (GKS * sh + (lv.gs || 0)) / (GKS + lv.tg) : sh;
 }
+// A goalie's share for anything past his return (next season's keeper value, how other managers see him): the refresh
+// job counts every team game, so a goalie who got hurt has his missed games counted as starts he lost. While he's on the
+// injury report he keeps his preseason share if that was higher (Shesterkin: 5 starts, then out for the season with a
+// knee, was at 28% instead of 51%, which made him worth nothing next season). A goalie who won the net keeps his gain.
+function gShareKeep(q) { const s = goalieShare(q), s0 = q.gm > 0 ? q.gs / q.gm : s; return gsOvShare(q) == null && hurt(q) && s0 > s ? s0 : s; }
 function buildGoalieBoost() {
   GBM = new Map();
   const byTeam = {}, GST = (LIVE && LIVE.gst) || {};
@@ -312,6 +329,20 @@ function buildGoalieBoost() {
       const sH = H.reduce((a, q) => a + base.get(q.id), 0), sA = A.reduce((a, q) => a + base.get(q.id), 0);
       if (!H.length || !(sH > 0)) continue;
       let scale = 1;
+      // a goalie whose job has been set (starts stepper or a call) keeps his share; his healthy teammates get the rest
+      const fx = H.filter((q) => gsOvShare(q) != null), sF = fx.reduce((a, q) => a + base.get(q.id), 0);
+      if (fx.length) {
+        const room = A.length ? GCAP - Math.min(GCAP, sA * GX0 / (sH + GX0)) : GCAP, sO = sH - sF;
+        const kF = sF > room ? room / sF : 1, kO = sO > 0 ? Math.min(A.length ? 9 : 1, Math.max(0, room - sF * kF) / sO) : 1;
+        for (const q of H) {
+          const b = base.get(q.id); if (!(b > 0)) continue;
+          const m = Math.min(fx.includes(q) ? kF : kO, 0.9 / b);
+          if (Math.abs(m - 1) < 0.005) continue;
+          if (!GBM.has(q.id)) GBM.set(q.id, new Map());
+          GBM.get(q.id).set(day.d, m);
+        }
+        continue;
+      }
       if (!A.length) { if (sH > GCAP) scale = GCAP / sH; }
       else {
         const ak = A.map((q) => q.id).join(",");
@@ -468,7 +499,6 @@ function gStart(p, day) {
   const r = rateOn(p, "G", day);
   if (!(r > 0)) return [0, 0];
   let sh = goalieShare(p) * gMult(p, day);
-  if (S.gsOv[p.id] != null && p.gs > 0) sh *= S.gsOv[p.id] / p.gs;
   const ps = sh > 0 ? Math.min(GCAP, sh) : 1;
   return [ps, r / ps];
 }
@@ -894,7 +924,11 @@ function ageFAt(p, a) {
   return Math.min(1.1, Math.max(0.6, c[0] * x * x + c[1] * x + c[2]));
 }
 // next season's points above waiver level if he plays slot s
-function nextAt(p, s, yr) { const a = p.age || 28, f = yr === 2 ? ageFAt(p, a) * ageFAt(p, a + 1) : ageFAt(p, a); return rateAt(p, s) * 82 * f - (REPL[s] || 0); }
+function nextAt(p, s, yr) {
+  const a = p.age || 28, f = yr === 2 ? ageFAt(p, a) * ageFAt(p, a + 1) : ageFAt(p, a);
+  const g = s === "G" && p.gs > 0 && goalieShare(p) > 0 ? gShareKeep(p) / goalieShare(p) : 1;
+  return rateAt(p, s) * g * 82 * f - (REPL[s] || 0);
+}
 function nextVal(p) { return p.unknown ? 0 : Math.max(0, ...elig(p).map((s) => nextAt(p, s))); }
 // the keeper group a roster would carry into next season: 1 C, 2 W, 2 D, 1 G + 1 extra skater, best total
 function keeperSet(list, yr) {
@@ -2053,10 +2087,20 @@ function evenIt(d) {
 // How a deal looks to a typical manager: the experts' preseason value blended with this season's points per game
 // (up to half weight by 10 games), so a hot start looks bigger and a cold one smaller, the way most people judge.
 // Our own numbers still decide what's good for you; this only guesses what they'll accept.
+// Both the experts' number and this season's pace are season totals at the games he was expected to play. Before
+// 2026-11-17 neither moved with playing time, so Jacob Fowler (projected for 23 starts, now Montreal's starter with
+// 94 points in 13) looked like nothing to other managers: his total stayed under a full-time starter's waiver level.
+// Now both are scaled by how much more or less he's playing than the board expected (a goalie's share of starts,
+// a skater's playing-time factor from the refresh job).
+function playScale(p) {
+  const l = liveOf(p);
+  if (p.slot === "G") return p.gs > 0 && p.gm > 0 && l && l.sh != null ? Math.min(2.5, gShareKeep(p) / (p.gs / p.gm)) : 1;
+  return (l && l.av) || 1;
+}
 function lookBase(p) {
-  const x0 = (p.mk != null && !p.rk ? p.mk : p.pts) || 0, l = liveOf(p), r = REPL[p.slot] || 0;
+  const g = playScale(p), x0 = ((p.mk != null && !p.rk ? p.mk : p.pts) || 0) * g, l = liveOf(p), r = REPL[p.slot] || 0;
   let x = x0;
-  if (l && l.n >= 3 && l.fp != null && p.gp > 0) { const w = Math.min(0.5, l.n / 20); x = (1 - w) * x0 + w * (l.fp / l.n) * p.gp; }
+  if (l && l.n >= 3 && l.fp != null && p.gp > 0) { const w = Math.min(0.5, l.n / 20); x = (1 - w) * x0 + w * (l.fp / l.n) * p.gp * g; }
   const now = Math.max(0, x - r) * fracLeft();
   const nx = p.gm > 0 ? Math.max(0, (x / p.gm) * 82 * ageF(p) - r) : 0;
   return now + 0.5 * nx;
@@ -2276,7 +2320,7 @@ function cardHTML(p, rank, key, owner, wk) {
   const tt2 = trendTag(p); if (tt2) tags.push(tt2);
   const ot2 = outTag(p); if (ot2) tags.push(ot2);
   if (p.nt) tags.push(`<span class="pill bad">No NHL contract</span>`);
-  if (p.slot === "G" && S.gsOv[p.id] != null) tags.push(`<span class="pill gold">Your starts: ${S.gsOv[p.id]}</span>`);
+  if (p.slot === "G" && S.gsOv[p.id] != null) tags.push(GS_CALLS[p.id] === S.gsOv[p.id] ? `<span class="pill gold" title="You told us to treat him as the starter: ${S.gsOv[p.id]} starts a season, ${Math.round(100 * gsOvShare(p))}% of his team's games. 'Back to our ${fmt(p.gs)}' on his card turns it off.">Starter (your call)</span>` : `<span class="pill gold">Your starts: ${S.gsOv[p.id]}</span>`);
   tags.push(starBtn(p));
   const shown = key === "ALL" ? rosOf(p) : rosAt(p, key);
   return `<div class="card ${mine ? "mineP" : ""}" data-id="${esc(p.id)}" style="--tc:var(--t${tier})">
@@ -2306,7 +2350,7 @@ function detailHTML(p) {
   if (p.mp != null && p.mk != null && !p.rk) {
     const pn = POSNAME[p.slot].toLowerCase();
     const w = p.wx != null ? Math.round(100 * (1 - p.wx)) : null;
-    lead += `<li class="info">Our stats say <b>${fmt(p.mp)}</b> points. The analysts' consensus (${p.mr ? ordinal(p.mr) + " " + pn : "unranked"}) works out to about <b>${fmt(p.mk)}</b> in this scoring. His number, <b>${fmt(ptsOf(p))}</b>, is ${w != null ? `${w}% ours` : "a blend"}.</li>`;
+    lead += `<li class="info">Our stats say <b>${fmt(p.mp)}</b> points. The analysts' consensus (${p.mr ? ordinal(p.mr) + " " + pn : "unranked"}) works out to about <b>${fmt(p.mk)}</b> in this scoring. His number, <b>${fmt(p.pts)}</b>, is ${w != null ? `${w}% ours` : "a blend"}${p.slot === "G" && S.gsOv[p.id] != null ? ` (that's at our ${fmt(p.gs)} starts; with ${GS_CALLS[p.id] === S.gsOv[p.id] ? "your call that he's the starter" : "your setting"}, ${fmt(S.gsOv[p.id])} starts, it would be about ${fmt(ptsOf(p))} over a full season)` : ""}.</li>`;
   }
   const bpd = boP(p);
   if (bpd != null) lead += `<li class="good">${isVet(p) ? "Big-year" : "Breakout"} chance: <b>${Math.round(100 * bpd)}%</b> that he beats his projection by 30% or more and ends up worth a roster spot (typical for a player projected like him: ${Math.round(100 * p.bo[1])}%).${isVet(p) ? vetNote(p) : ""}${p.bw && p.bw.length ? " Why: " + p.bw.map(esc).join("; ") + "." : ""}</li>`;
@@ -2378,9 +2422,9 @@ function onListClick(e) {
   if (d.star) { toggleStar(d.star); renderBoardList(); return; }
   if (d.gs) {
     const p = PL.get(d.gs); const cur = gsOf(p);
-    S.gsOv[d.gs] = Math.max(0, Math.min(84, Math.round((cur + Number(d.d)) / 5) * 5)); LS.set("zb-gs", S.gsOv); clearCaches(); renderBoardList(); return;
+    S.gsOv[d.gs] = Math.max(0, Math.min(84, Math.round((cur + Number(d.d)) / 5) * 5)); LS.set("zb-gs", S.gsOv); buildGoalieBoost(); clearCaches(); renderBoardList(); return;
   }
-  if (d.gsreset) { delete S.gsOv[d.gsreset]; LS.set("zb-gs", S.gsOv); clearCaches(); renderBoardList(); }
+  if (d.gsreset) { if (GS_CALLS[d.gsreset] != null) S.gsOv[d.gsreset] = null; else delete S.gsOv[d.gsreset]; LS.set("zb-gs", S.gsOv); buildGoalieBoost(); clearCaches(); renderBoardList(); }
 }
 
 /* ---------------- league ---------------- */
@@ -2783,8 +2827,8 @@ function init() {
   $("#foot").innerHTML = `Stats and schedule from the NHL. League and rosters from Fantrax (read-only). Injury statuses from ESPN's NHL injury report. Analyst rankings from ${META.experts.n} public sources, blended; no lists are reproduced here. Not affiliated with the NHL or Fantrax. <button class="btn" id="resetBtn" style="margin-left:6px;padding:4px 10px;font-size:12.5px">Clear my stars and goalie starts</button>`;
   $("#resetBtn").onclick = () => {
     if (!confirmReset()) return;
-    S.stars = {}; S.gsOv = {}; LS.set("zb-stars", {}); LS.set("zb-gs", {});
-    clearCaches(); S.lastSig = ""; renderAll(); toast("Cleared stars and goalie starts");
+    S.stars = {}; S.gsOv = { ...GS_CALLS }; LS.set("zb-stars", {}); LS.set("zb-gs", {});
+    buildGoalieBoost(); clearCaches(); S.lastSig = ""; renderAll(); toast("Cleared stars and goalie starts");
   };
   boardShell();
   const hash = location.hash.replace("#", "");
