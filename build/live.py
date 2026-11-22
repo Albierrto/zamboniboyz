@@ -74,15 +74,36 @@ def get(url, tries=6, ua="zamboniboyz-refresh/1.0"):
     raise RuntimeError(f"{url}: {last}")
 
 
+def stats(path, exp, sort, key, flags="isAggregate=true&isGame=false"):
+    """Every row of an NHL stats report. Since 2026-11-19 the API returns at most 100 rows a request (limit=-1 used to
+    return all of them), and for three days this job read only the first 100 skaters of each report: 156 of 788 board
+    players were updated and the rest fell back to their preseason numbers (John Tavares, with no live data, became
+    the top free agent). So it pages through in a fixed order and refuses to go on with a partial report."""
+    rows, seen, start, total = [], set(), 0, None
+    srt = urllib.parse.quote(json.dumps([{"property": k, "direction": "ASC"} for k in sort]))
+    while True:
+        d = get(f"https://api.nhle.com/stats/rest/en/{path}?{flags}&sort={srt}&limit=100&start={start}"
+                f"&cayenneExp={urllib.parse.quote(exp)}")
+        page, total = d.get("data", []), d.get("total") or 0
+        for r in page:
+            k = key(r)
+            if k not in seen:
+                seen.add(k)
+                rows.append(r)
+        start += 100
+        time.sleep(0.6)
+        if not page or start >= total:
+            break
+    if total and len(rows) < total:
+        raise RuntimeError(f"{path}: {len(rows)} of {total} rows")
+    return rows
+
+
 def nhl(kind, report, d0=None, d1=None):
     exp = f"seasonId={SEASON} and gameTypeId=2"
     if d0: exp += f' and gameDate>="{d0}"'
     if d1: exp += f' and gameDate<="{d1}"'
-    url = (f"https://api.nhle.com/stats/rest/en/{kind}/{report}?isAggregate=true&isGame=false&limit=-1&start=0"
-           f"&cayenneExp={urllib.parse.quote(exp)}")
-    d = get(url)
-    time.sleep(1.5)
-    return {r["playerId"]: r for r in d.get("data", [])}
+    return {r["playerId"]: r for r in stats(f"{kind}/{report}", exp, ["playerId"], lambda r: r["playerId"])}
 
 
 def goalie_log(today, thru=None):
@@ -90,10 +111,8 @@ def goalie_log(today, thru=None):
     Returns ({team: [[date, nhlId], ...]} in game order, {nhlId: name})."""
     hi = thru or (today - dt.timedelta(days=1)).isoformat()
     exp = f'seasonId={SEASON} and gameTypeId=2 and gameDate<="{hi}"'
-    url = ("https://api.nhle.com/stats/rest/en/goalie/summary?isAggregate=false&isGame=true&limit=-1&start=0"
-           f"&cayenneExp={urllib.parse.quote(exp)}")
-    rows = get(url).get("data", [])
-    time.sleep(1.5)
+    rows = stats("goalie/summary", exp, ["gameId", "playerId"], lambda r: (r["gameId"], r["playerId"]),
+                 "isAggregate=false&isGame=true")
     by, names = {}, {}
     for r in rows:
         if not r.get("gamesStarted") or not r.get("teamAbbrev"):
@@ -134,10 +153,9 @@ def current_teams():
     prev = f"{int(SEASON[:4]) - 1}{SEASON[:4]}"
     for season in (prev, SEASON):
         for kind in ("skater", "goalie"):
-            exp = urllib.parse.quote(f"seasonId={season} and gameTypeId=2")
-            d = get(f"https://api.nhle.com/stats/rest/en/{kind}/bios?isAggregate=false&isGame=false&limit=-1&start=0&cayenneExp={exp}")
-            time.sleep(1.5)
-            for r in d.get("data", []):
+            rows = stats(f"{kind}/bios", f"seasonId={season} and gameTypeId=2", ["playerId"], lambda r: r["playerId"],
+                         "isAggregate=false&isGame=false")
+            for r in rows:
                 if r.get("currentTeamAbbrev"):
                     cur[r["playerId"]] = r["currentTeamAbbrev"]
     return cur
@@ -393,6 +411,11 @@ def main():
         if p.get("ret") and rec.get("n") and p["id"] not in out["inj"]:
             out.setdefault("back", []).append(p["id"])
     out["asOf"] = y
+    # a stats pull that comes back short (the API changed its paging on 2026-11-19) must not replace a good file: the
+    # site would quietly fall back to preseason numbers for everyone missing
+    n_pid = sum(1 for p in players if p.get("pid"))
+    if out["started"] and len(out["players"]) < 0.5 * n_pid:
+        raise RuntimeError(f"only {len(out['players'])} of {n_pid} players updated; keeping the last live.json")
     json.dump(out, open(OUT, "w"), separators=(",", ":"))
     print(f"live: {len(out['players'])} players updated through {y}")
 
