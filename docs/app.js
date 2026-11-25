@@ -49,7 +49,7 @@ const S = {
   pos: "ALL", q: "", faOnly: LS.get("zb-fa", false), sort: "ros", show: 60, open: null,
   tmode: ["both", "me", "yes", "weak"].includes(LS.get("zb-tmode", "both")) ? LS.get("zb-tmode", "both") : "both", tteam: "ALL",
   hor: ["now", "both", "next", "later"].includes(LS.get("zb-hor2", "later")) ? LS.get("zb-hor2", "later") : "later",
-  addMode: LS.get("zb-addmode", "ros"), addPos: "ALL", addOpen: null, addShow: 25,
+  addMode: LS.get("zb-addmode", "ros"), addPos: "ALL", addOpen: null, addShow: 25, fkWho: LS.get("zb-fkwho", "ALL"), fkSeen: null,
   stars: LS.get("zb-stars", {}),
   gsOv: { ...GS_CALLS, ...LS.get("zb-gs", {}) },  // goalie id -> season starts (null = back to the model's number)
   leagueOpen: {},
@@ -152,6 +152,97 @@ function boP(p) {
   // the breakout test was fitted on the per-game part of the update, so the playing-time part (l.av) is taken out
   if (l && m && l.n) z += META.breakout.chg * Math.log(m / (l.av || 1)) * (l.n / (l.n + 5));
   return 1 / (1 + Math.exp(-z));
+}
+
+/* ---------------- future keepers (2026-11-25) ---------------- */
+// Bort: "I would like the website to really prioritize players that could become keepers ... It hit on a few but
+// seems to notify way too late." Keeper chance = the chance a skater who isn't keeper-level yet is one next season:
+// among the league's top 80 skaters by next season's points above waiver level (12 teams keep 6 skaters each, plus
+// flex picks). Fit on nine past seasons (2016-17..2024-25, build/keeper_chance.py) on players who were below that
+// line both before the season and the season before, at about 10 and 22 team games, blended by games played.
+// What it learned: next season's projection moves too little early on; scoring above his projection matters more
+// than the old update allowed, and much more for players new to the NHL; more power-play time, more ice time, being
+// under 24, a high draft pick, playing every night and being a center all push the chance up. In that test, at
+// about 10 games in, players at 25%+ became keeper-level 33% of the time (16 a season, about 7 times the usual rate
+// in that group), and its top 20 each season caught 27% of the players who did, vs 24% for next season's
+// projection after this season's update (the way the site ranked them before) and 21% for the preseason one.
+const FKM = {
+  top: 80, flag: 0.25,
+  test: { g10: { flagN: 16, hit: 0.33, base: 0.047, top20: 0.274, top20old: 0.241, top20pre: 0.212 }, g22: { flagN: 18, hit: 0.37, top20: 0.292, top20old: 0.237 } },
+  g10: { b: -1.2406, gap: 0.0215, pre_gap: -0.00253, dev: 0.30641, dtoi: 0.11504, dpp: 0.27029, agec: -0.10689, young: 0.45142, rookie: 0.59891, y_dev: -0.31775, r_dev: 0.46167, share: 0.69836, sC: 0.41622, sD: 0.00527, ldov: -0.24391 },
+  g22: { b: -1.7581, gap: 0.00629, pre_gap: 0.01303, dev: 0.79876, dtoi: 0.09113, dpp: 0.2386, agec: -0.09164, young: 0.43876, rookie: 0.3711, y_dev: -0.11213, r_dev: 0.5826, share: 1.14687, sC: 0.53351, sD: 0.03215, ldov: -0.23029 },
+};
+// next season's value at slot s from the preseason projection alone (no update from this season)
+function preNextAt(p, s) { return p.gm > 0 ? (ptsAt(p, s) / p.gm) * 82 * ageFAt(p, p.age || 28) - (REPL[s] || 0) : -999; }
+// the keeper line: the 80th-best skater by that preseason number
+function fkLine() {
+  return memo("fkline", () => { const v = B.players.filter((p) => p.slot !== "G" && p.gm > 0 && !p.unknown).map((p) => preNextAt(p, p.slot)).sort((a, b) => b - a); return v[FKM.top - 1] ?? 40; });
+}
+function histGP(p) { return (p.hist || []).reduce((a, h) => a + (+h[2] || 0), 0); }
+function lastSeasonAbove(p) { const h = (p.hist || []).slice(-1)[0]; return h ? (+h[13] || 0) - (REPL[p.slot] || 0) : -999; }  // last season's points above waiver level
+function fkInputs(p) {
+  if (!p || p.slot === "G" || p.unknown || !(p.gm > 0) || !(p.gp > 0) || !["C", "W", "D"].includes(p.slot)) return null;
+  const l = liveOf(p); if (!l || !(l.n >= 3) || !(l.tg > 0)) return null;
+  const L = fkLine(), s = p.slot, pre = preNextAt(p, s);
+  if (pre >= L || lastSeasonAbove(p) >= L) return null;  // keeper-level already: not a future keeper
+  const n = l.n, prior = ptsAt(p, s) / p.gp, sc = l.fps && l.fps[s] != null ? l.fps[s] : l.fp, early = sc / n;
+  const age = p.age || 26, young = age < 24 ? 1 : 0, rookie = histGP(p) < 30 ? 1 : 0, dev = ((early - prior) * n) / (n + 10);
+  const dv = LIVE && LIVE.dov ? LIVE.dov[p.id] : undefined;
+  return { L, prior, early, n, tg: l.tg, dv, x: { gap: nextAt(p, s, 1) - L, pre_gap: pre - L, dev, dtoi: l.dtoi || 0, dpp: l.dpp || 0, agec: age - 26, young, rookie, y_dev: young * dev, r_dev: rookie * dev, share: Math.min(1, n / l.tg), sC: s === "C" ? 1 : 0, sD: s === "D" ? 1 : 0, ldov: Math.log(dv == null ? 49 : Math.min(250, Math.max(1, dv || 250))) } };
+}
+function fkChance(p) {
+  if (!p) return null;
+  return memo("fk|" + p.id, () => {
+    const f = fkInputs(p); if (!f) return null;
+    const z = (m) => Object.keys(f.x).reduce((t, k) => t + m[k] * f.x[k], m.b);
+    const w = Math.min(1, Math.max(0, (f.tg - 10) / 12));
+    return 1 / (1 + Math.exp(-((1 - w) * z(FKM.g10) + w * z(FKM.g22))));
+  });
+}
+// what's pushing him up, in plain words
+function fkWhy(p) {
+  const f = fkInputs(p); if (!f) return [];
+  const out = [], l = liveOf(p);
+  if (f.prior > 0 && f.early >= f.prior * 1.12) out.push(`scoring ${Math.round(100 * (f.early / f.prior - 1))}% above his projection (${fmt(f.early, 1)} a game in ${f.n})`);
+  if ((l.dpp || 0) >= 0.4) out.push(`about ${fmt(l.dpp, 1)} more power-play minutes a game than last season`);
+  if ((l.dtoi || 0) >= 1) out.push(`about ${fmt(l.dtoi, 1)} more minutes a game overall`);
+  if ((p.age || 30) < 24) out.push(`only ${p.age}`);
+  if (f.x.rookie) out.push("new to the NHL, so this season says more about him");
+  if (f.dv && f.dv <= 15) out.push(`drafted ${ordinal(f.dv)} overall`);
+  if (f.x.share >= 0.95 && f.n >= 8) out.push("hasn't missed a game");
+  return out;
+}
+// does he crack this team's 7 keepers if he gets there? He's compared with the weakest keeper he could replace (same
+// position or the flex spot). If he becomes keeper-level, a typical player like that ends up about 30 points past
+// the line (median in the test; 40 on average).
+function fkFit(p, team) {
+  const c = fkChance(p); if (c == null || !team) return null;
+  const mine = owners()[p.id] === team;
+  const worst = memo("fkworst|" + team + "|" + p.slot + "|" + ROV + "|" + (mine ? p.id : ""), () => {
+    const k = keeperSet(rosterOf(team).filter((q) => q !== p)).keep;
+    let w = null;
+    for (const [id, s] of k.entries()) {
+      if (s !== p.slot && s !== "X") continue;
+      const q = player(id), v = s === "X" ? Math.max(...elig(q).map((x) => nextAt(q, x, 1))) : nextAt(q, s, 1);
+      if (!w || v < w.v) w = { q, v, s };
+    }
+    return w;
+  });
+  const vHit = Math.max(nextAt(p, p.slot, 1), fkLine() + 30);
+  return worst ? { worst, vHit, gain: vHit - worst.v, up: c * Math.max(0, vHit - worst.v) } : { worst: null, vHit, gain: vHit, up: c * vHit };
+}
+function fkPill(p) { const c = fkChance(p); return c != null && c >= FKM.flag ? `<span class="pill gold" title="Chance he's keeper-level next season (top 80 skaters in this league's scoring). In testing, players flagged this early made it about a third of the time.">Future keeper ${Math.round(100 * c)}%</span>` : ""; }
+function futureKeepers() {
+  return memo("fklist|" + ROV + "|" + (LIVE ? LIVE.generated : ""), () => B.players.map((p) => ({ p, c: fkChance(p) })).filter((x) => x.c != null && x.c >= 0.1).sort((a, b) => b.c - a.c));
+}
+// first time each player was flagged (kept in this browser), so new ones can be called out
+function fkNew(d) { return Date.parse(todayET()) - Date.parse(d) <= 3 * 864e5; }  // first flagged in the last 3 days
+function fkSeen(list) {
+  const seen = LS.get("zb-fk-seen", {}), today = todayET();
+  let ch = false;
+  for (const x of list) if (x.c >= FKM.flag && !seen[x.p.id]) { seen[x.p.id] = today; ch = true; }
+  if (ch) LS.set("zb-fk-seen", seen);
+  return seen;
 }
 function trendTag(p) {
   const l = liveOf(p), m = liveMult(p);
@@ -768,7 +859,7 @@ function gainBases(roster, days, os, all) {
   return { pre, post, preV: pre.length ? rangeValue(roster, pre) : 0, postV: post.length ? rangeValue(roster, post) : 0 };
 }
 function pickups(team, mode) {
-  return memo("adds|" + mode + "|" + rosterKey(team) + "|" + fromDay() + "|" + JSON.stringify(S.gsOv) + "|" + JSON.stringify(S.live.status && rosterOf(team).map((p) => onIR(p.id) ? 1 : 0)), () => {
+  return memo("adds|" + mode + "|" + S.hor + "|" + rosterKey(team) + "|" + fromDay() + "|" + JSON.stringify(S.gsOv) + "|" + JSON.stringify(S.live.status && rosterOf(team).map((p) => onIR(p.id) ? 1 : 0)), () => {
     const roster = rosterOf(team);
     const rosDays = windowDays("ros");
     const days = windowDays(mode);
@@ -783,6 +874,10 @@ function pickups(team, mode) {
     const fa = freeAgents().map((p) => ({ p, e: bestRate(p) * gamesW(p, days) })).filter((x) => x.e > 0);
     const pool = [];
     for (const s of ["C", "W", "D", "G"]) pool.push(...fa.filter((x) => elig(x.p)[0] === s).sort((a, b) => b.e - a.e).slice(0, s === "G" ? 20 : 40));
+    // future keepers ride along even when they don't help this season yet (2026-11-25)
+    for (const x of fa) if (!pool.includes(x) && (fkChance(x.p) || 0) >= 0.15) pool.push(x);
+    // how much next season counts against this one ("What counts for you"): 4x when building for later
+    const kw = mode === "ros" ? horW() / Math.max(0.1, horN()) : 0;
     const out = [];
     for (const { p } of pool) {
       const best = addGain(roster, p, days, drops, os, bases);
@@ -790,6 +885,11 @@ function pickups(team, mode) {
       // upside: you can drop him if the breakout doesn't come, so part of a breakout's extra points counts
       const bp = boP(p);
       item.up = mode === "ros" && bp ? 0.25 * bp * META.breakout.uplift * Math.min(1, item.games / 82) : 0;
+      // keeper upside: his chance of being keeper-level next season times what that adds over the weakest keeper
+      // he'd replace, in next-season points, weighted by how much next season counts for you
+      const fk = kw ? fkFit(p, team) : null;
+      item.kup = fk ? fk.up * kw : 0;
+      item.up += item.kup;
       out.push(item);
     }
     out.sort((a, b) => b.gain + b.up - (a.gain + a.up));
@@ -1277,10 +1377,21 @@ function renderTeam() {
     const then = addPick.drop && addPick.drop !== addPick.p ? ` When he's back, drop ${esc(addPick.drop.n)}.` : addPick.drop === addPick.p ? ` When he's back, drop ${esc(addPick.p.n)} again.` : "";
     todo.push(`<li><b>Pick up ${esc(addPick.p.n)}</b> (${esc(addPick.p.t)}). ${os && os.who ? `${esc(os.who.n)} is on IR, so you` : "You"} have an open roster spot and don't need to drop anyone${back}.${then} About ${sgn(addPick.gain)} points for the rest of the season. <button class="linkbtn" data-tab="adds">All pickups</button></li>`);
   } else if (addPick) {
-    todo.push(`<li><b>Pick up ${esc(addPick.p.n)}</b> (${esc(addPick.p.t)}) and drop ${esc(addPick.drop.n)}: about ${sgn(addPick.gain)} points for the rest of the season.${addPick.alt ? ` Dropping ${esc(addPick.alt.drop.n)} instead: ${sgn(addPick.alt.g)}.` : ""} <button class="linkbtn" data-tab="adds">All pickups</button></li>`);
+    todo.push(`<li><b>Pick up ${esc(addPick.p.n)}</b> (${esc(addPick.p.t)}) and drop ${esc(addPick.drop.n)}: about ${sgn(addPick.gain)} points for the rest of the season.${addPick.alt ? ` Dropping ${esc(addPick.alt.drop.n)} instead: ${sgn(addPick.alt.g)}.` : ""}${(addPick.kup || 0) >= 3 ? ` He's also a future keeper: a ${Math.round(100 * fkChance(addPick.p))}% chance he's keeper-level next season.` : ""} <button class="linkbtn" data-tab="adds">All pickups</button></li>`);
   }
   const stash = breakouts(S.team)[0];
   if (stash && stash.b >= 0.22) todo.push(`<li><b>Keep an eye on ${esc(stash.p.n)}</b> (${esc(stash.p.t)}): the best ${isVet(stash.p) ? "big-year" : "breakout"} bet on waivers, a ${Math.round(100 * stash.b)}% chance he beats his projection by 30% or more and ends up worth a roster spot (${Math.round(100 * stash.p.bo[1])}% is typical for a player projected like him). Worth a bench spot if you have a weak one. <button class="linkbtn" data-bo="1">Breakout list</button></li>`);
+  // future keepers (2026-11-25): the best free agent to stash who could be a keeper next season and beat one of yours,
+  // and the best trade target on another team; "New" for 3 days after a player is first flagged in this browser
+  {
+    const fks = futureKeepers(); S.fkSeen = fkSeen(fks);
+    const own = owners(), fit = (x) => ({ ...x, f: fkFit(x.p, S.team) });
+    const why1 = (p) => { const w = fkWhy(p).slice(0, 2); return w.length ? ` (${esc(w.join(", "))})` : ""; };
+    const fa = fks.filter((x) => !own[x.p.id] && x.c >= FKM.flag && !(addPick && addPick.p === x.p)).map(fit).filter((x) => x.f && x.f.gain > 5).sort((a, b) => b.f.up - a.f.up)[0];
+    if (fa) todo.push(`<li><b>${fkNew(S.fkSeen[fa.p.id]) ? "New: " : ""}Stash ${esc(fa.p.n)}</b> (${esc(fa.p.t)}${fa.p.age ? `, ${fa.p.age}` : ""}), a free agent with a <b>${Math.round(100 * fa.c)}%</b> chance of being keeper-level next season${why1(fa.p)}.${fa.f.worst ? ` If he gets there he'd beat ${esc(fa.f.worst.q.n)} as your ${FKW[fa.f.worst.s]} keeper.` : ""} <button class="linkbtn" data-fk="1">Future keepers</button></li>`);
+    const tg = fks.filter((x) => own[x.p.id] && own[x.p.id] !== S.team && x.c >= 0.35).map(fit).filter((x) => x.f && x.f.gain > 15).sort((a, b) => b.f.up - a.f.up)[0];
+    if (tg) todo.push(`<li><b>${fkNew(S.fkSeen[tg.p.id]) ? "New: " : ""}Trade target: ${esc(tg.p.n)}</b> (${esc(tname(own[tg.p.id]))}, ${tg.p.age}): <b>${Math.round(100 * tg.c)}%</b> chance he's keeper-level next season${why1(tg.p)}, before his manager notices. <button class="linkbtn" data-fk="1">Future keepers</button></li>`);
+  }
   const chip = roster.filter(analystsBacked).sort((a, b) => mval(b) - mval(a))[0];
   if (chip) todo.push(`<li><b>Shop ${esc(chip.n)} in trades.</b> The experts rank him ${ordinal(chip.mr)} among ${POSPL[chip.slot]}, but our numbers have him ${ordinal(chip.orank)} for this league's scoring, so other managers will likely value him more than he helps you. Use him to get what you need. <button class="linkbtn" data-shopid="${esc(chip.id)}">Find trades for him</button></li>`);
   todo.push(`<li><b>Check goalies each game day.</b> A goalie who doesn't start scores nothing, so play the ones who are confirmed to start and sit the rest. That's why a 3rd or 4th goalie is worth having: he plays for you nearly every time he starts.</li>`);
@@ -1344,6 +1455,7 @@ function renderTeam() {
   el.querySelectorAll("[data-open]").forEach((b) => (b.onclick = () => openPlayer(b.dataset.open)));
   el.querySelectorAll("[data-shopid]").forEach((b) => (b.onclick = () => shopPlayer(b.dataset.shopid)));
   el.querySelectorAll("[data-bo]").forEach((b) => (b.onclick = () => { S.addMode = "bo"; LS.set("zb-addmode", "bo"); setTab("adds"); }));
+  el.querySelectorAll("[data-fk]").forEach((b) => (b.onclick = () => { S.addMode = "fk"; LS.set("zb-addmode", "fk"); setTab("adds"); }));
   el.querySelectorAll("[data-scroll]").forEach((b) => (b.onclick = () => { const t = document.getElementById(b.dataset.scroll); if (t) t.scrollIntoView({ behavior: "smooth", block: "start" }); }));
   const team = S.team;
   tradeSearch(team).then((all) => {
@@ -1397,6 +1509,7 @@ function boCard(x, rank) {
   const p = x.p, open = S.addOpen === p.id;
   const tags = [];
   tags.push(`<span class="tag">Typical for his projection: <b>${Math.round(100 * p.bo[1])}%</b></span>`);
+  { const fp = fkPill(p); if (fp) tags.push(fp); }
   if (x.free) tags.push(x.gain >= 1 ? `<span class="tag">Fits your open roster spot: <b class="gainv">${sgn(x.gain)}</b> pts</span>` : `<span class="tag">Only helps while your open spot lasts: watch him</span>`);
   else tags.push(x.gain >= 1 ? `<span class="tag">Already better than ${esc(x.drop.n)}: <b class="gainv">${sgn(x.gain)}</b> pts</span>`
     : `<span class="tag" title="Adding him now in place of ${esc(x.drop.n)} would cost about ${Math.round(-x.gain)} points unless he breaks out">Not better than your weakest player yet: watch him</span>`);
@@ -1420,17 +1533,19 @@ function renderAdds() {
   const el = $("#tab-adds");
   const mode = S.addMode;
   if (mode === "bo") return renderBreakouts(el);
+  if (mode === "fk") return renderFutureKeepers(el);
   const res = pickups(S.team, mode);
   const per = periodOf(fromDay());
   let rows = res.list;
   if (S.addPos !== "ALL") rows = rows.filter((x) => elig(x.p).includes(S.addPos));
-  const good = rows.filter((x) => x.gain >= 1);
+  // players who help now, plus future keepers worth a stash when next season counts for you (2026-11-25)
+  const good = rows.filter((x) => x.gain >= 1 || (x.kup || 0) >= 3);
   const chips = [["ALL", "All"], ["C", "C"], ["W", "W"], ["D", "D"], ["G", "G"]];
   const drops = res.contrib.slice(0, 4);
   el.innerHTML = `
     <div class="lede"><h2>Pickups</h2><p>Free agents (players nobody owns) who'd make <b>${esc(tname(S.team))}</b> better, and who to drop for each. Each one is tested in your real lineup night by night, so games and crowded positions count. There's no weekly limit, but each claim costs $2 ($4 for a goalie or on a Sunday) and each drop $1. Use <b>This week</b> to chase a close matchup.</p></div>
     <div class="controls">
-      <div class="chips" role="group" aria-label="Time frame"><button data-mode="ros" aria-pressed="${mode === "ros"}">Rest of season</button><button data-mode="week" aria-pressed="${mode === "week"}">This week${per ? ` (wk ${per.n})` : ""}</button><button data-mode="bo" aria-pressed="${mode === "bo"}">Breakouts</button></div>
+      <div class="chips" role="group" aria-label="Time frame"><button data-mode="ros" aria-pressed="${mode === "ros"}">Rest of season</button><button data-mode="week" aria-pressed="${mode === "week"}">This week${per ? ` (wk ${per.n})` : ""}</button><button data-mode="bo" aria-pressed="${mode === "bo"}">Breakouts</button><button data-mode="fk" aria-pressed="${mode === "fk"}">Future keepers</button></div>
       <div class="chips" role="group" aria-label="Position">${chips.map(([k, l]) => `<button data-apos="${k}" aria-pressed="${S.addPos === k}">${l}</button>`).join("")}</div>
     </div>
     ${res.os ? `<div class="banner"><b>You have an open roster spot</b>${res.os.who ? ` because ${esc(res.os.who.n)} is on IR` : ""}, so your next pickup doesn't need a drop${res.os.until ? ` until he's back (around ${esc(dLabel(res.os.until, { month: "short", day: "numeric" }))}). After that you'll have to drop someone, and the points below already count that` : ""}.</div>` : ""}
@@ -1461,7 +1576,7 @@ function renderBreakouts(el) {
   el.innerHTML = `
     <div class="lede"><h2>Pickups</h2><p>Free agents with the most <b>breakout</b> upside: players with the best chance to <b>beat their projection by 30% or more</b> and end up worth a roster spot, ranked by how much that chance beats what's typical for a player projected like them. For players 30 and up it's called a big year: it happens about as often, but it rarely lasts. Stash one on your bench when you have a spare spot; if it doesn't happen, drop him.</p></div>
     <div class="controls">
-      <div class="chips" role="group" aria-label="Time frame"><button data-mode="ros" aria-pressed="false">Rest of season</button><button data-mode="week" aria-pressed="false">This week</button><button data-mode="bo" aria-pressed="true">Breakouts</button></div>
+      <div class="chips" role="group" aria-label="Time frame"><button data-mode="ros" aria-pressed="false">Rest of season</button><button data-mode="week" aria-pressed="false">This week</button><button data-mode="bo" aria-pressed="true">Breakouts</button><button data-mode="fk" aria-pressed="false">Future keepers</button></div>
       <div class="chips" role="group" aria-label="Position">${chips.map(([k, l]) => `<button data-apos="${k}" aria-pressed="${S.addPos === k}">${l}</button>`).join("")}</div>
     </div>
     <div class="banner soft">${LIVE && LIVE.started ? `Chances update with this season's stats ${LIVE.generated ? `(last checked ${agoText(Date.parse(LIVE.generated))})` : ""}: more ice time or a bigger power-play role pushes a player up. In testing, about 20 games in, players at 40% or more broke out ${Math.round(100 * t.ins.g20.flag)}% of the time.` : `Chances come from last season's ice time, games missed, on-ice numbers, age and where the analysts rank him, and move with this season's stats once games start. Nobody is a sure thing yet: in testing, the top 30 each year broke out ${Math.round(100 * t.top30)}% of the time, about double the ${Math.round(100 * t.base_rate)}% for everyone else near waiver level.`}</div>
@@ -1665,7 +1780,9 @@ function addCard(x0, rank, mode, list) {
   { const it = injTag(p); if (it) tags.push(it); }
   if (p.rk) tags.push(`<span class="pill gold">Rookie</span>`);
   if (p.mr && p.orank && p.mr + 8 <= p.orank) tags.push(`<span class="pill good" title="Analysts rank him higher than our stats do">Analysts like him</span>`);
-  if (x.up >= 1.5) tags.push(`<span class="tag" title="Ranked with a small bonus for breakout upside: a quarter of the extra points a breakout usually brings, times his chance">Upside <b>+${Math.round(x.up)}</b></span>`);
+  if (x.up - (x.kup || 0) >= 1.5) tags.push(`<span class="tag" title="Ranked with a small bonus for breakout upside: a quarter of the extra points a breakout usually brings, times his chance">Upside <b>+${Math.round(x.up - (x.kup || 0))}</b></span>`);
+  if ((x.kup || 0) >= 1.5) tags.push(`<span class="tag good" title="Ranked with a bonus for his chance of being keeper-level next season, times what that would add over the weakest keeper he'd replace, weighted by how much next season counts for you (What counts for you, on the Trades tab)">Keeper upside <b>+${Math.round(x.kup)}</b></span>`);
+  { const fp = fkPill(p); if (fp) tags.push(fp); }
   const bp = boP(p); if (bp && bp >= 0.2) tags.push(`<span class="pill gold" title="${esc(BOTITLE(p))}">${boWord(p)} ${Math.round(100 * bp)}%</span>`);
   const tt = trendTag(p); if (tt) tags.push(tt);
   const ot = outTag(p); if (ot) tags.push(ot);
@@ -1680,9 +1797,67 @@ function addCard(x0, rank, mode, list) {
     <div class="subrow">${tags.join("")}</div>
     ${dropOptsHTML(x0, o, mode)}
     ${dropCompareHTML(x0, o, mode)}
-    ${fy ? `<ul class="why bwhy"><li class="info">${fy}</li></ul>` : ""}
+    ${fy || (x.kup || 0) >= 3 ? `<ul class="why bwhy">${fy ? `<li class="info">${fy}</li>` : ""}${(x.kup || 0) >= 3 ? `<li class="good">${fkStashText(p, x.gain)}</li>` : ""}</ul>` : ""}
     ${open ? detailHTML(p) : ""}
   </div>`;
+}
+// why a future keeper is worth a roster spot even when he doesn't help this season
+function fkStashText(p, gain) {
+  const c = fkChance(p), f = fkFit(p, S.team), w = fkWhy(p);
+  return `<b>${Math.round(100 * c)}% chance he's keeper-level next season</b>${w.length ? ` (${esc(w.slice(0, 3).join(", "))})` : ""}.${f && f.worst ? ` If he gets there he'd beat ${esc(f.worst.q.n)} as your ${FKW[f.worst.s]} keeper.` : ""}${gain < 1 ? ` He ${gain <= -1 ? `costs about ${Math.round(-gain)} points` : "doesn't add much"} this season, so it's a stash for later.` : ""}`;
+}
+
+/* ---------------- future keepers list (2026-11-25) ---------------- */
+const FKW = { C: "center", W: "winger", D: "defenseman", X: "flex" };
+function fkCard(x, rank) {
+  const p = x.p, open = S.addOpen === p.id, ow = owners()[p.id];
+  const tags = [];
+  tags.push(ow === S.team ? `<span class="tag good">Yours</span>` : ow ? `<span class="tag">${esc(tname(ow))}</span>` : `<span class="tag good">Free agent</span>`);
+  const f = fkFit(p, S.team);
+  if (ow !== S.team && f && f.worst && f.gain > 5) tags.push(`<span class="tag good" title="If he becomes keeper-level, a typical player like that ends up about ${Math.round(f.vHit)} points above waiver level next season">Would beat ${esc(f.worst.q.n)} (${Math.round(f.worst.v)}) as your ${FKW[f.worst.s]} keeper</span>`);
+  if (ow === S.team) tags.push(`<span class="tag" title="Keep him: he's trending toward a keeper spot">Don't sell low</span>`);
+  if (ow && ow !== S.team) tags.push(`<button class="pill good pbtn" data-shop="${esc(p.id)}">Trade for him →</button>`);
+  { const it = injTag(p); if (it) tags.push(it); }
+  const tt = trendTag(p); if (tt) tags.push(tt);
+  tags.push(starBtn(p));
+  const why = fkWhy(p).map((t) => `<li class="good">${esc(t[0].toUpperCase() + t.slice(1))}</li>`).join("");
+  const seen = S.fkSeen && S.fkSeen[p.id], isNew = seen && fkNew(seen) && x.c >= FKM.flag;
+  return `<div class="card" data-id="${esc(p.id)}" style="--tc:var(--t${tierOf(valOf(p))})">
+    <button class="row" data-atoggle="${esc(p.id)}" aria-expanded="${open}">
+      <div class="rank">${rank}</div>${face(p)}
+      <div class="who"><div class="nm">${esc(p.n)}${isNew ? ` <span class="pill gold">New</span>` : ""}</div><div class="mt">${posBadge(p)}<span>${esc(p.t)}${p.age ? ` · ${p.age}` : ""}</span></div></div>
+      <div class="bigpts"><div class="p">${Math.round(100 * x.c)}%</div><div class="l">keeper chance</div></div>
+    </button>
+    <div class="subrow">${tags.join("")}</div>
+    ${why ? `<ul class="why bwhy">${why}</ul>` : ""}
+    ${open ? detailHTML(p) : ""}
+  </div>`;
+}
+function renderFutureKeepers(el) {
+  const who = S.fkWho || "ALL", own = owners();
+  const all = futureKeepers();
+  S.fkSeen = fkSeen(all);
+  const list = all.filter((x) => (S.addPos === "ALL" || x.p.slot === S.addPos) && (who === "ALL" || (who === "FA" ? !own[x.p.id] : who === "MINE" ? own[x.p.id] === S.team : own[x.p.id] && own[x.p.id] !== S.team))).slice(0, 40);
+  const chips = [["ALL", "All"], ["C", "C"], ["W", "W"], ["D", "D"]], whos = [["ALL", "Everyone"], ["FA", "Free agents"], ["OTHER", "Other teams"], ["MINE", "Yours"]];
+  const t = FKM.test, nFlag = all.filter((x) => x.c >= FKM.flag).length;
+  el.innerHTML = `
+    <div class="lede"><h2>Pickups</h2><p><b>Future keepers:</b> skaters who aren't keeper-level yet, ranked by the chance they're among the league's <b>top 80 skaters next season</b> (about where teams draw the line with 7 keepers each). It leans on what shows up early: scoring above his projection, a bigger power-play or overall role, age, being new to the NHL, where he was drafted, and playing every night. Free agents are stash candidates, other teams' players are trade targets before their managers notice, and yours are the ones not to sell low.</p></div>
+    <div class="controls">
+      <div class="chips" role="group" aria-label="Time frame"><button data-mode="ros" aria-pressed="false">Rest of season</button><button data-mode="week" aria-pressed="false">This week</button><button data-mode="bo" aria-pressed="false">Breakouts</button><button data-mode="fk" aria-pressed="true">Future keepers</button></div>
+      <div class="chips" role="group" aria-label="Whose">${whos.map(([k, l]) => `<button data-fkwho="${k}" aria-pressed="${who === k}">${l}</button>`).join("")}</div>
+      <div class="chips" role="group" aria-label="Position">${chips.map(([k, l]) => `<button data-apos="${k}" aria-pressed="${S.addPos === k}">${l}</button>`).join("")}</div>
+    </div>
+    <div class="banner soft">Tested on nine past seasons: about 10 games in, players at ${Math.round(100 * FKM.flag)}% or more became keeper-level next season <b>${Math.round(100 * t.g10.hit)}%</b> of the time (about ${t.g10.flagN} a season), around 7 times the usual rate for players who weren't keeper-level before. About a third hit, so treat these as stashes and early trade targets, not sure things. ${nFlag} player${nFlag === 1 ? " is" : "s are"} at ${Math.round(100 * FKM.flag)}% or more right now${LIVE && LIVE.generated ? ` (updated ${agoText(Date.parse(LIVE.generated))})` : ""}. Goalies aren't in this list: their value is mostly about who starts.</div>
+    <div class="list" id="addList">${list.map((x, i) => fkCard(x, i + 1)).join("") || `<div class="empty">Nobody here right now.</div>`}</div>`;
+  el.querySelectorAll("[data-mode]").forEach((b) => (b.onclick = () => { S.addMode = b.dataset.mode; LS.set("zb-addmode", S.addMode); S.addShow = 25; renderAdds(); }));
+  el.querySelectorAll("[data-apos]").forEach((b) => (b.onclick = () => { S.addPos = b.dataset.apos === "G" ? "ALL" : b.dataset.apos; renderAdds(); }));
+  el.querySelectorAll("[data-fkwho]").forEach((b) => (b.onclick = () => { S.fkWho = b.dataset.fkwho; LS.set("zb-fkwho", S.fkWho); renderAdds(); }));
+  $("#addList").onclick = (e) => {
+    const sh = e.target.closest("[data-shop]"); if (sh) { shopPlayer(sh.dataset.shop); return; }
+    const b = e.target.closest("[data-atoggle],[data-star]"); if (!b) return;
+    if (b.dataset.star) { toggleStar(b.dataset.star); renderAdds(); return; }
+    S.addOpen = S.addOpen === b.dataset.atoggle ? null : b.dataset.atoggle; renderAdds();
+  };
 }
 
 /* ---------------- trades tab ---------------- */
@@ -2357,6 +2532,7 @@ function cardHTML(p, rank, key, owner, wk) {
   if (p.mr) tags.push(`<span class="tag" title="Where the analyst consensus ranks him among ${POSPL[p.slot]}">Analysts: <b>${ordinal(p.mr)} ${esc(p.slot)}</b></span>`);
   { const it = injTag(p); if (it) tags.push(it); }
   if (p.rk) tags.push(`<span class="pill gold">Rookie</span>`);
+  { const fp = fkPill(p); if (fp) tags.push(fp); }
   const bp2 = boP(p); if (bp2 && bp2 >= 0.2) tags.push(`<span class="pill gold" title="${esc(BOTITLE(p))}">${boWord(p)} ${Math.round(100 * bp2)}%</span>`);
   const tt2 = trendTag(p); if (tt2) tags.push(tt2);
   const ot2 = outTag(p); if (ot2) tags.push(ot2);
@@ -2395,6 +2571,8 @@ function detailHTML(p) {
   }
   const bpd = boP(p);
   if (bpd != null) lead += `<li class="good">${isVet(p) ? "Big-year" : "Breakout"} chance: <b>${Math.round(100 * bpd)}%</b> that he beats his projection by 30% or more and ends up worth a roster spot (typical for a player projected like him: ${Math.round(100 * p.bo[1])}%).${isVet(p) ? vetNote(p) : ""}${p.bw && p.bw.length ? " Why: " + p.bw.map(esc).join("; ") + "." : ""}</li>`;
+  { const c = fkChance(p);
+    if (c != null && c >= 0.05) { const w = fkWhy(p); lead += `<li class="good">Keeper chance: <b>${Math.round(100 * c)}%</b> that he's keeper-level next season (top 80 skaters in this league's scoring), from what he's shown so far${w.length ? ": " + esc(w.join("; ")) : ""}. In testing, players at ${Math.round(100 * FKM.flag)}% or more this early made it about a third of the time.</li>`; } }
   const lv = liveOf(p);
   if (p.t0 !== undefined && p.t !== p.t0) lead += `<li class="info">He's with ${esc(p.t)} now${p.t0 ? ` (traded from ${esc(p.t0)})` : ""}. His schedule here follows ${esc(p.t)}; his projection was built before the move, and it shifts as he plays.</li>`;
   if (lv && lv.n) lead += `<li class="info">This season so far: ${lv.n} game${lv.n === 1 ? "" : "s"}, ${seasonPtsText(lv)}${lv.toi ? `, ${fmt(lv.toi, 1)} min a game` : ""}${lv.pp ? ` (${fmt(lv.pp, 1)} on the power play)` : ""}. His projection has moved ${sgn(100 * ((liveMult(p) || 1) - 1))}% since the season started.${lv.av && p.gp && p.gm ? ` Part of that is playing time: the projection expected him in about ${Math.round((100 * p.gp) / p.gm)}% of his team's games, and he's played ${lv.n} of ${lv.tg}.` : ""}</li>`;
@@ -2629,6 +2807,7 @@ function renderHow() {
     <li><b>Age:</b> unlike baseball, veterans do this about as often as young players (${Math.round(100 * META.breakout.test.age.rate_old)}% of players 30 and up vs ${Math.round(100 * META.breakout.test.age.rate_young)}% of younger ones in that range), because a hockey season swings a lot with linemates, assists, plus/minus and games played. What differs is what it means. Younger players usually got there with a bigger job (${Math.round(100 * META.breakout.test.age.role_young)}% gained 1.5+ minutes a night or more power-play time, vs ${Math.round(100 * META.breakout.test.age.role_old)}% of veterans), and veterans kept less of it the next season (${Math.round(100 * META.breakout.test.age.keep_old)}% vs ${Math.round(100 * META.breakout.test.age.keep_young)}%). So for players 30 and up the site calls it a <b>big year</b>: worth a pickup, not a keeper price.</li>
     <li><b>Once games start</b>, a refresh job pulls this season's stats from the NHL several times a day and moves every projection. How fast depends on the stat, tested on five past seasons: faceoffs and hits settle within a couple of weeks; goals barely count early because hot shooting streaks don't last. More ice time or a bigger power-play role adds on top. Breakout chances move with it: in testing, about 10 games in, players the update put at 40% or more broke out ${Math.round(100 * META.breakout.test.ins.g10.flag)}% of the time (${Math.round(100 * META.breakout.test.ins.g20.flag)}% by 20 games), while simply chasing a hot start (scoring 30% above his projection) worked ${Math.round(100 * META.breakout.test.ins.g10.hot)}% of the time (${Math.round(100 * META.breakout.test.ins.g20.hot)}% by 20 games).</li>
     <li><b>Pickups</b> give a small bonus for breakout upside (a quarter of the extra points a breakout usually brings, since you can drop him if it doesn't happen), so between two similar free agents the one with more upside ranks first.</li>
+    <li><b>Future keepers</b> (Pickups → Future keepers, and a gold "Future keeper" tag anywhere in the site): the chance a skater who isn't keeper-level yet will be among the league's top 80 skaters next season, about where teams draw the line with 7 keepers each. Fit on nine past seasons on players who were below that line before the season and the season before, checked at about 10 and 22 games. Next season's projection moves too slowly early on, so it looks at more: scoring above his projection (it counts more for players new to the NHL), more power-play and overall ice time, age (under 24 helps), draft position, playing every night, and position (centers do it more often). About 10 games in, players at ${Math.round(100 * FKM.flag)}% or more made it ${Math.round(100 * FKM.test.g10.hit)}% of the time, around 7 times the usual rate, and its top 20 each season caught ${Math.round(100 * FKM.test.g10.top20)}% of the players who did, vs ${Math.round(100 * FKM.test.g10.top20old)}% for next season's projection after this season's update. Pickups add a <b>keeper upside</b> bonus: his chance times what he'd add over the weakest keeper he'd replace, weighted by how much next season counts for you, so with "Build for later" a likely future keeper can outrank a pickup who only helps this season. Goalies aren't covered: their value is mostly about who starts.</li>
     <li><b>Who's getting the net:</b> each goalie's share of starts begins at the preseason guess and moves toward who has actually been starting, with recent games counting most (each game further back counts about 9% less, so the last two or three weeks matter most). A goalie who hasn't played at all loses share too. Tested on 11 past seasons, this beat a plain season-to-date update at 7 of 8 checkpoints. It still moves more slowly than a hot streak looks on purpose: backups who had started 4 of their team's last 5 around this point went on to make about half the starts the rest of the way, not all of them.</li>
     <li><b>Goalies in your lineup:</b> a skater with a game plays, but a goalie only scores when he starts, and you can see who's starting before your lineup locks (a minute before each game). So the site doesn't just hand your 2 goalie spots to your 2 best goalies. Each night, every goalie of yours with a game has a chance to start (his share of his team's starts), and you play whichever ones do, up to 2. A 3rd or 4th goalie counts nearly every time he starts, because it's rare that 3 of yours start on the same night. Before Nov 12 the site gave the spots to the 2 best goalies every night, so extra goalies looked like free drops.</li>
     <li><b>Hurt goalies and crowded nets:</b> one goalie starts each game, so a team's healthy goalies can't add up to more than about 97% of its starts. When a goalie is out, the healthy ones split what's left after whoever else is starting (the refresh job records every team's starting goalie, game by game, so a call-up who's getting the net counts). When everyone is healthy and their shares add up to more than that, usually because a goalie just came back and his stand-ins piled up starts, all of them are scaled down to fit. Call-ups who are starting but aren't in this site's player list show up at the top of Pickups if they're free agents.</li>
