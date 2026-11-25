@@ -149,7 +149,7 @@ def current_teams():
     this the site kept Matthew Knies on Toronto's schedule six weeks after he went to Columbus, and Connor Hellebuyck
     in Winnipeg's net after his trade to New Jersey. Last season's report is read first so players who haven't
     played yet this season (injured) are covered too; this season's wins."""
-    cur = {}
+    cur, dov = {}, {}
     prev = f"{int(SEASON[:4]) - 1}{SEASON[:4]}"
     for season in (prev, SEASON):
         for kind in ("skater", "goalie"):
@@ -158,7 +158,9 @@ def current_teams():
             for r in rows:
                 if r.get("currentTeamAbbrev"):
                     cur[r["playerId"]] = r["currentTeamAbbrev"]
-    return cur
+                if kind == "skater":
+                    dov[r["playerId"]] = r.get("draftOverall") or 0  # 0 = undrafted (the keeper-chance model reads it)
+    return cur, dov
 
 
 def goalie_plan(players, tm, glog):
@@ -296,12 +298,15 @@ def main():
     out["started"] = bool(summ)
     # who has changed NHL teams since the board was built: {board id: team now}
     try:
-        cur_team = current_teams()
+        cur_team, dov = current_teams()
         tm = {p["id"]: cur_team[p["pid"]] for p in players if p.get("pid") and cur_team.get(p["pid"]) and cur_team[p["pid"]] != (p.get("t") or "")}
         print(f"teams: {len(tm)} players have moved since the board was built")
+        # where each skater was drafted (overall pick, 0 = undrafted): one input to the keeper-chance model (2026-11-25)
+        out["dov"] = {p["id"]: dov[p["pid"]] for p in players if p.get("pid") and p["pid"] in dov}
     except Exception as e:  # keep the last good list
         print("current teams skipped:", e)
         tm = old.get("tm") or {}
+        out["dov"] = old.get("dov") or {}
     out["tm"] = tm
     glog = None
     try:
